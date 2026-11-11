@@ -2,6 +2,7 @@
 
 Serves a single-page dashboard where you can:
   - create a run from a prompt + tunable parameters,
+  - review and edit the proposed plan, then approve or reject it,
   - watch jobs progress live (SSE),
   - browse every step's log (implement/fix, test, pr),
   - cancel a running job or retry a failed task.
@@ -23,7 +24,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from . import __version__, engine, events
+from . import __version__, engine, events, planner
 from .config import Config
 from .errors import RalphError
 from .store import Store, default_db_path
@@ -101,8 +102,43 @@ def _build_cfg(params: dict[str, Any]) -> Config:
     )
 
 
+def _planning_worker(ctx: "ServerContext", run_id: int, params: dict[str, Any]) -> None:
+    """Planning-only worker: build the plan for review, never execute a task.
+
+    Ends in 'awaiting_approval' (awaiting explicit user approval) or
+    'error'. Releases the repo claim either way.
+    """
+    ctx.workers[run_id] = threading.Event()
+    try:
+        ctx.store.set_run_status(run_id, "planning")
+        cfg = _build_cfg(params)
+        plan = planner.plan(cfg, params.get("prompt", ""))
+        for t in plan.tasks:
+            ctx.store.upsert_task(run_id, t.to_dict())
+        ctx.store.set_plan_test_cmd(run_id, plan.test_cmd)
+        ctx.hub.publish(run_id, {"name": "planned", "data": {
+            "tasks": [t.to_dict() for t in plan.tasks],
+            "test_cmd": plan.test_cmd,
+        }})
+        ctx.store.set_run_status(run_id, "awaiting_approval")
+    except (RalphError, ValueError, OSError) as exc:
+        ctx.hub.publish(run_id, {"name": "error", "data": {"message": str(exc)}})
+        ctx.store.finish_run(run_id, "error", str(exc))
+    except Exception as exc:  # unexpected
+        ctx.hub.publish(run_id, {"name": "error", "data": {"message": f"internal error: {exc}"}})
+        ctx.store.finish_run(run_id, "error", f"internal error: {exc}")
+    finally:
+        ctx.workers.pop(run_id, None)
+        ctx.release_repo(params.get("repo") or ".", run_id)
+
+
 def _worker(ctx: "ServerContext", run_id: int, params: dict[str, Any],
             only_task: int | None = None) -> None:
+    """Execution worker: runs the stored (approved) plan for a run.
+
+    A fresh execution uses the plan stored during the review stage;
+    a retry reuses the existing plan/state and runs a single task.
+    """
     cancel = threading.Event()
     ctx.workers[run_id] = cancel
     sink = WebSink(ctx.store, ctx.hub, run_id)
@@ -112,15 +148,28 @@ def _worker(ctx: "ServerContext", run_id: int, params: dict[str, Any],
         ctx.hub.publish(run_id, {"name": "closed", "data": {"status": status, "error": error}})
 
     try:
-        ctx.store.set_run_status(run_id, "planning")
+        ctx.store.set_run_status(run_id, "running")
         cfg = _build_cfg(params)
+        plan = None
+        if only_task is None:
+            # Fresh execution: build the plan from the stored, approved
+            # one (set by _planning_worker / PUT /api/runs/{id}/plan).
+            stored = ctx.store.get_plan(run_id)
+            if stored is None or not stored["tasks"]:
+                raise RalphError("no approved plan for this run")
+            plan = planner.Plan(
+                test_cmd=stored["test_cmd"],
+                tasks=[planner.Task(id=int(t["task_id"]), title=t["title"],
+                                    description=t["description"])
+                       for t in stored["tasks"]],
+            )
         report = engine.run(
             cfg,
             params.get("prompt", ""),
-            # A new run always plans fresh for its own prompt; a retry
-            # reuses the existing plan and runs a single task.
-            force_plan=(only_task is None),
+            # A fresh run executes the pre-supplied plan; a retry reuses
+            # the existing plan and runs a single task.
             only=only_task,
+            plan=plan,
             sink=sink,
             is_cancelled=cancel.is_set,
         )
@@ -246,8 +295,22 @@ class Handler(BaseHTTPRequestHandler):
                 self._create_run()
             elif m := re.fullmatch(r"/api/runs/(\d+)/cancel", path):
                 self._cancel(int(m.group(1)))
+            elif m := re.fullmatch(r"/api/runs/(\d+)/approve", path):
+                self._approve(int(m.group(1)))
+            elif m := re.fullmatch(r"/api/runs/(\d+)/reject", path):
+                self._reject(int(m.group(1)))
             elif m := re.fullmatch(r"/api/runs/(\d+)/retry/(\d+)", path):
                 self._retry(int(m.group(1)), int(m.group(2)))
+            else:
+                self._json(404, {"error": "not found"})
+        except BrokenPipeError:
+            pass
+
+    def do_PUT(self) -> None:  # noqa: N802
+        path = urlparse(self.path).path
+        try:
+            if m := re.fullmatch(r"/api/runs/(\d+)/plan", path):
+                self._update_plan(int(m.group(1)))
             else:
                 self._json(404, {"error": "not found"})
         except BrokenPipeError:
@@ -284,10 +347,93 @@ class Handler(BaseHTTPRequestHandler):
             self._json(409, {"error": f"a run for this repo is already active (#{conflict})",
                              "run_id": run_id})
             return
-        t = threading.Thread(target=_worker, args=(self.ctx, run_id, b),
-                             name=f"ralph-run-{run_id}", daemon=True)
+        # Planning-only stage: the run parks in 'awaiting_approval' until an
+        # explicit POST /api/runs/{id}/approve starts execution.
+        t = threading.Thread(target=_planning_worker, args=(self.ctx, run_id, b),
+                             name=f"ralph-plan-{run_id}", daemon=True)
         t.start()
         self._json(201, {"run_id": run_id})
+
+    def _update_plan(self, run_id: int) -> None:
+        row = self.ctx.store.get_run(run_id)
+        if row is None:
+            self._json(404, {"error": "no such run"})
+            return
+        if row["status"] != "awaiting_approval":
+            self._json(409, {"error": "the plan can only be edited while the run is awaiting approval"})
+            return
+        b = self._body()
+        raw = b.get("tasks")
+        if not isinstance(raw, list) or not raw:
+            self._json(400, {"error": "'tasks' must be a non-empty list"})
+            return
+        tasks: list[dict[str, Any]] = []
+        for i, item in enumerate(raw, start=1):
+            if not isinstance(item, dict):
+                self._json(400, {"error": f"task #{i} is not an object"})
+                return
+            try:
+                task_id = int(item.get("task_id"))
+            except (TypeError, ValueError):
+                self._json(400, {"error": f"task #{i} needs an integer task_id"})
+                return
+            title = str(item.get("title") or "").strip()
+            description = str(item.get("description") or "").strip()
+            if not title or not description:
+                self._json(400, {"error": f"task #{i} is missing title or description"})
+                return
+            tasks.append({"task_id": task_id, "title": title, "description": description})
+        test_cmd = b.get("test_cmd")
+        if test_cmd is not None and not isinstance(test_cmd, str):
+            self._json(400, {"error": "test_cmd must be a string or null"})
+            return
+        self.ctx.store.replace_tasks(run_id, tasks)
+        self.ctx.store.set_plan_test_cmd(run_id, test_cmd or None)
+        plan = self.ctx.store.get_plan(run_id)
+        # Notify open UIs so the task list refreshes (same shape as the
+        # engine's 'planned' event).
+        self.ctx.hub.publish(run_id, {"name": "planned", "data": {
+            "tasks": [{"id": t["task_id"], "title": t["title"],
+                       "description": t["description"], "status": t["status"],
+                       "iterations": t["iterations"]}
+                      for t in plan["tasks"]],
+            "test_cmd": plan["test_cmd"],
+        }})
+        self._json(200, {"ok": True, "plan": plan})
+
+    def _approve(self, run_id: int) -> None:
+        row = self.ctx.store.get_run(run_id)
+        if row is None:
+            self._json(404, {"error": "no such run"})
+            return
+        if row["status"] != "awaiting_approval":
+            self._json(409, {"error": "run is not awaiting approval"})
+            return
+        params = {**row["params"], "prompt": row["prompt"]}
+        # Re-claim the repo for execution (the planning worker released it).
+        conflict = self.ctx.claim_repo(params.get("repo") or ".", run_id)
+        if conflict is not None and conflict != run_id:
+            self._json(409, {"error": f"repo already in use by run {conflict}"})
+            return
+        self.ctx.store.set_run_status(run_id, "running")
+        t = threading.Thread(target=_worker, args=(self.ctx, run_id, params),
+                             name=f"ralph-run-{run_id}", daemon=True)
+        t.start()
+        self._json(200, {"ok": True})
+
+    def _reject(self, run_id: int) -> None:
+        row = self.ctx.store.get_run(run_id)
+        if row is None:
+            self._json(404, {"error": "no such run"})
+            return
+        if row["status"] != "awaiting_approval":
+            self._json(409, {"error": "run is not awaiting approval"})
+            return
+        # Close without executing anything; the repo claim was already
+        # released when the planning worker finished.
+        self.ctx.store.finish_run(run_id, "cancelled", None)
+        self.ctx.hub.publish(run_id, {"name": "closed", "data": {"status": "cancelled", "error": None}})
+        self._json(200, {"ok": True})
 
     def _get_run(self, run_id: int) -> None:
         d = self.ctx.store.get_run(run_id)
@@ -325,6 +471,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if run_id in self.ctx.workers:
             self._json(409, {"error": "run is still active; cancel it first"})
+            return
+        if row["status"] == "awaiting_approval":
+            self._json(409, {"error": "approve or reject the plan before retrying"})
             return
         task = next((t for t in self.ctx.store.get_tasks(run_id) if t["task_id"] == task_id), None)
         if task is None:

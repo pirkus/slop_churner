@@ -1,5 +1,7 @@
 """End-to-end test for the web UI/API: creates runs over HTTP with a stubbed
-agent and verifies runs, tasks and step logs land in the SQLite store.
+agent and verifies the plan-review flow (create -> awaiting_approval ->
+edit plan -> approve -> execute), plus tasks, step logs and SSE events land
+correctly in the SQLite store.
 
 Run:  python3 tests/web_smoke.py
 """
@@ -80,6 +82,15 @@ def wait_for(url: str, key: str, values, timeout: float = 30) -> dict:
     raise TimeoutError(f"{key} never reached {values}")
 
 
+def expect_error(method: str, url: str, code: int, body: dict | None = None) -> None:
+    try:
+        api_call(method, url, body)
+    except urllib.error.HTTPError as e:
+        assert e.code == code, f"expected {code}, got {e.code}"
+        return
+    raise AssertionError(f"expected HTTP {code} for {method} {url}")
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="ralph-web-smoke-"))
     repo = tmp / "proj"
@@ -111,7 +122,7 @@ def main() -> int:
         page = r.read().decode()
     assert "<form id=\"newrun\">" in page and "EventSource" in page
 
-    # -- create run 1 (green after one fix loop) ------------------------------
+    # -- create run 1: parks in awaiting_approval, nothing executes ----------
     r1 = api_call("POST", f"{base}/api/runs", {
         "prompt": "add a subtract function",
         "repo": str(repo),
@@ -121,32 +132,77 @@ def main() -> int:
     })
     rid = r1["run_id"]
     assert rid >= 1
+    run = wait_for(f"{base}/api/runs/{rid}", "status", {"awaiting_approval", "error"})
+    assert run["status"] == "awaiting_approval", run
+    assert len(run["tasks"]) == 1
+    t1 = run["tasks"][0]
+    assert t1["title"] == "Add a subtract function"
+    assert t1["status"] == "pending" and t1["iterations"] == 0, t1
+    # No task may have executed while awaiting approval.
+    assert "def subtract" not in (repo / "app.py").read_text()
 
-    # -- SSE: subscribe and make sure live events actually stream ---------------
-    conn = HTTPConnection("127.0.0.1", port, timeout=20)
+    # -- edit the plan while awaiting approval (PUT /plan) --------------------
+    edited = {
+        "tasks": [
+            {"task_id": 1, "title": "Add a subtract function (edited)",
+             "description": "Add subtract(a, b) to app.py returning a - b, with a test."},
+            {"task_id": 2, "title": "Add a multiply function",
+             "description": "Add multiply(a, b) to app.py returning a * b."},
+        ],
+        "test_cmd": "true",
+    }
+    api_call("PUT", f"{base}/api/runs/{rid}/plan", edited)
+    run = api_call("GET", f"{base}/api/runs/{rid}")
+    assert run["status"] == "awaiting_approval", run
+    assert [t["task_id"] for t in run["tasks"]] == [1, 2], run["tasks"]
+    assert run["tasks"][0]["title"] == "Add a subtract function (edited)"
+    assert run["tasks"][1]["title"] == "Add a multiply function"
+    assert all(t["status"] == "pending" and t["iterations"] == 0 for t in run["tasks"])
+    assert ctx.store.get_plan(rid)["test_cmd"] == "true"
+    # Still nothing executed.
+    assert "def subtract" not in (repo / "app.py").read_text()
+
+    # -- plan edit validation (while still awaiting approval) ------------------
+    expect_error("PUT", f"{base}/api/runs/{rid}/plan", 400, {"tasks": []})
+    expect_error("PUT", f"{base}/api/runs/{rid}/plan", 400,
+                 {"tasks": [{"task_id": 1, "title": "x"}]})
+    expect_error("PUT", f"{base}/api/runs/{rid}/plan", 400,
+                 {"tasks": [{"task_id": 1, "title": "x", "description": "d"}],
+                  "test_cmd": 42})
+
+    # -- SSE: subscribe, then approve; live events must stream ----------------
+    conn = HTTPConnection("127.0.0.1", port, timeout=30)
     conn.request("GET", f"/api/runs/{rid}/events")
     resp = conn.getresponse()
     assert resp.status == 200 and "text/event-stream" in resp.getheader("Content-Type")
+    threading.Thread(
+        target=lambda: api_call("POST", f"{base}/api/runs/{rid}/approve"),
+        daemon=True,
+    ).start()
     seen = []
-    deadline = time.time() + 20
+    deadline = time.time() + 30
     while time.time() < deadline:
         line = resp.fp.readline()
         if not line:
             break
         if line.startswith(b"data: "):
             seen.append(json.loads(line[6:]))
-        if any(e["name"] == "step" for e in seen):
+        if any(e["name"] == "closed" for e in seen):
             break
     conn.close()
-    assert any(e["name"] == "task_updated" for e in seen), seen
-    assert any(e["name"] == "step" for e in seen), seen
+    names = [e["name"] for e in seen]
+    for expected in ("planned", "task_updated", "step", "closed"):
+        assert expected in names, f"missing {expected} in SSE stream: {names}"
 
     run = wait_for(f"{base}/api/runs/{rid}", "status", {"done", "error", "failed"})
     assert run["status"] == "done", run
-    assert len(run["tasks"]) == 1
+    assert [t["task_id"] for t in run["tasks"]] == [1, 2]
     t1 = run["tasks"][0]
+    assert t1["title"] == "Add a subtract function (edited)", t1
     assert t1["status"] == "done"
     assert t1["iterations"] == 2, "expected implement->fail->fix->pass"
+    t2 = run["tasks"][1]
+    assert t2["status"] == "done"
 
     # -- step logs ------------------------------------------------------------
     task = api_call("GET", f"{base}/api/runs/{rid}/tasks/{t1['task_id']}")
@@ -166,7 +222,12 @@ def main() -> int:
 
     # -- runs list -------------------------------------------------------------
     lst = api_call("GET", f"{base}/api/runs")["runs"]
-    assert any(r["id"] == rid and r["n_done"] == 1 and r["n_tasks"] == 1 for r in lst), lst
+    assert any(r["id"] == rid and r["n_done"] == 2 and r["n_tasks"] == 2 for r in lst), lst
+
+    # -- plan review endpoints reject once the run is no longer awaiting -------
+    expect_error("PUT", f"{base}/api/runs/{rid}/plan", 409, edited)
+    expect_error("POST", f"{base}/api/runs/{rid}/approve", 409)
+    expect_error("POST", f"{base}/api/runs/{rid}/reject", 409)
 
     # -- store plan API: get_plan / replace_tasks -------------------------------
     # Migration: an old-schema DB (no plan_test_cmd) must gain the column.
@@ -191,9 +252,10 @@ def main() -> int:
 
     plan = ctx.store.get_plan(rid)
     assert plan is not None and plan["test_cmd"] == "true", plan
-    assert [t["task_id"] for t in plan["tasks"]] == [1]
+    assert [t["task_id"] for t in plan["tasks"]] == [1, 2]
     assert ctx.store.get_plan(999999) is None
 
+    cur_tasks = ctx.store.get_tasks(rid)
     new_tasks = [
         {"task_id": 7, "title": "fresh one", "description": "d7"},
         {"task_id": 9, "title": "fresh two", "description": "d9"},
@@ -206,9 +268,9 @@ def main() -> int:
     plan = ctx.store.get_plan(rid)
     assert [t["task_id"] for t in plan["tasks"]] == [7, 9]
     # restore the original task list so the run stays consistent
-    ctx.store.replace_tasks(rid, [{"task_id": t1["task_id"], "title": t1["title"],
-                                   "description": t1["description"]}])
-    assert [t["task_id"] for t in ctx.store.get_tasks(rid)] == [1]
+    ctx.store.replace_tasks(rid, [{"task_id": t["task_id"], "title": t["title"],
+                                   "description": t["description"]} for t in cur_tasks])
+    assert [t["task_id"] for t in ctx.store.get_tasks(rid)] == [1, 2]
 
     # -- validation errors ------------------------------------------------------
     try:
@@ -217,7 +279,7 @@ def main() -> int:
     except urllib.error.HTTPError as e:
         assert e.code == 400
 
-    # -- run 2: failing task -> retry ------------------------------------------
+    # -- run 2: failing task -> approve -> fail -> retry ------------------------
     stub.fail_always = True
     r2 = api_call("POST", f"{base}/api/runs", {
         "prompt": "add a subtract function",
@@ -227,18 +289,52 @@ def main() -> int:
         "max_iterations": 2,
     })
     rid2 = r2["run_id"]
+    run2 = wait_for(f"{base}/api/runs/{rid2}", "status", {"awaiting_approval", "error"})
+    assert run2["status"] == "awaiting_approval", run2
+    # Retrying before approval must be refused.
+    expect_error("POST", f"{base}/api/runs/{rid2}/retry/{run2['tasks'][0]['task_id']}", 409)
+    api_call("POST", f"{base}/api/runs/{rid2}/approve")
     run2 = wait_for(f"{base}/api/runs/{rid2}", "status", {"done", "error", "failed"})
     assert run2["status"] == "failed", run2
     assert run2["tasks"][0]["status"] == "failed"
     assert "always failing" in run2["tasks"][0]["last_error"]
 
-    # retry the failed task with tests back to green
+    # retry the failed task with tests back to green (reuses the existing plan)
     stub.fail_always = False
     flaky_tests.n = 0
     api_call("POST", f"{base}/api/runs/{rid2}/retry/{run2['tasks'][0]['task_id']}")
     run2 = wait_for(f"{base}/api/runs/{rid2}", "status", {"done", "error"})
     assert run2["status"] == "done", run2
     assert run2["tasks"][0]["status"] == "done"
+
+    # -- run 3: reject the plan -> cancelled, nothing executed -------------------
+    r3 = api_call("POST", f"{base}/api/runs", {
+        "prompt": "add a subtract function",
+        "repo": str(repo),
+        "base": "main",
+        "test_cmd": "true",
+    })
+    rid3 = r3["run_id"]
+    run3 = wait_for(f"{base}/api/runs/{rid3}", "status", {"awaiting_approval", "error"})
+    assert run3["status"] == "awaiting_approval", run3
+    api_call("POST", f"{base}/api/runs/{rid3}/reject")
+    run3 = api_call("GET", f"{base}/api/runs/{rid3}")
+    assert run3["status"] == "cancelled", run3
+    assert run3["tasks"][0]["status"] == "pending" and run3["tasks"][0]["iterations"] == 0
+    assert run3["running"] is False
+
+    # -- run 4: repo claim was released by the rejected run ----------------------
+    r4 = api_call("POST", f"{base}/api/runs", {
+        "prompt": "add a subtract function",
+        "repo": str(repo),
+        "base": "main",
+        "test_cmd": "true",
+    })
+    rid4 = r4["run_id"]
+    assert api_call("GET", f"{base}/api/runs/{rid4}")["status"] in (
+        "planning", "awaiting_approval", "error"), "repo claim should be free"
+    wait_for(f"{base}/api/runs/{rid4}", "status", {"awaiting_approval", "error"})
+    api_call("POST", f"{base}/api/runs/{rid4}/reject")
 
     # -- cancel endpoint on a finished run must 409 ------------------------------
     try:
@@ -251,7 +347,7 @@ def main() -> int:
     assert db.exists()
     import sqlite3
     conn = sqlite3.connect(str(db))
-    assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 4
     assert conn.execute("SELECT COUNT(*) FROM steps").fetchone()[0] >= 11
     conn.close()
 
