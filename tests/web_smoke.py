@@ -168,6 +168,48 @@ def main() -> int:
     lst = api_call("GET", f"{base}/api/runs")["runs"]
     assert any(r["id"] == rid and r["n_done"] == 1 and r["n_tasks"] == 1 for r in lst), lst
 
+    # -- store plan API: get_plan / replace_tasks -------------------------------
+    # Migration: an old-schema DB (no plan_test_cmd) must gain the column.
+    from ralph.store import Store
+    old_db = tmp / "old-schema.db"
+    import sqlite3 as _s3
+    _c = _s3.connect(str(old_db))
+    _c.execute("CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+               "repo TEXT NOT NULL, prompt TEXT NOT NULL, "
+               "params TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL, "
+               "error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, "
+               "finished_at TEXT)")
+    _c.execute("INSERT INTO runs (repo, prompt, params, status, created_at, updated_at) "
+               "VALUES ('r', 'p', '{}', 'queued', 't', 't')")
+    _c.commit(); _c.close()
+    _s = Store(old_db)
+    old_cols = {r[1] for r in _s._conn.execute("PRAGMA table_info(runs)")}
+    assert "plan_test_cmd" in old_cols, old_cols
+    _s.set_plan_test_cmd(1, "pytest -q")
+    assert _s.get_plan(1) == {"test_cmd": "pytest -q", "tasks": []}
+    _s.close()
+
+    plan = ctx.store.get_plan(rid)
+    assert plan is not None and plan["test_cmd"] == "true", plan
+    assert [t["task_id"] for t in plan["tasks"]] == [1]
+    assert ctx.store.get_plan(999999) is None
+
+    new_tasks = [
+        {"task_id": 7, "title": "fresh one", "description": "d7"},
+        {"task_id": 9, "title": "fresh two", "description": "d9"},
+    ]
+    ctx.store.replace_tasks(rid, new_tasks)
+    replaced = ctx.store.get_tasks(rid)
+    assert [t["task_id"] for t in replaced] == [7, 9], replaced
+    assert [t["title"] for t in replaced] == ["fresh one", "fresh two"]
+    assert all(t["status"] == "pending" for t in replaced)
+    plan = ctx.store.get_plan(rid)
+    assert [t["task_id"] for t in plan["tasks"]] == [7, 9]
+    # restore the original task list so the run stays consistent
+    ctx.store.replace_tasks(rid, [{"task_id": t1["task_id"], "title": t1["title"],
+                                   "description": t1["description"]}])
+    assert [t["task_id"] for t in ctx.store.get_tasks(rid)] == [1]
+
     # -- validation errors ------------------------------------------------------
     try:
         api_call("POST", f"{base}/api/runs", {"prompt": "", "repo": str(repo)})
