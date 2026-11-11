@@ -121,6 +121,15 @@ def main() -> int:
     with urllib.request.urlopen(f"{base}/") as r:
         page = r.read().decode()
     assert "<form id=\"newrun\">" in page and "EventSource" in page
+    # Plan review UI: awaiting_approval must render an editable plan with
+    # add/remove-task, an optional test cmd, approve (PUT /plan + approve)
+    # and reject actions, and the SSE handler must refresh on 'planned'.
+    for needle in (
+        "awaiting_approval", "planReview", "Add task", "Approve and start",
+        "Reject", "remove", 'plan_test_cmd', 'method: "PUT"',
+        "/plan", "/approve", "/reject", 'name === "planned"',
+    ):
+        assert needle in page, f"ui.html is missing {needle!r}"
 
     # -- create run 1: parks in awaiting_approval, nothing executes ----------
     r1 = api_call("POST", f"{base}/api/runs", {
