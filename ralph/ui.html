@@ -78,6 +78,7 @@
   }
   .pill.pending, .pill.queued, .pill.cancelled { color: var(--dim); border-color: var(--dim); }
   .pill.planning, .pill.pr { color: var(--accent); border-color: var(--accent); }
+  .pill.awaiting_approval { color: var(--amber); border-color: var(--amber); }
   .pill.implementing, .pill.testing, .pill.fixing, .pill.running { color: var(--amber); border-color: var(--amber); }
   .pill.done { color: var(--green); border-color: var(--green); }
   .pill.failed, .pill.error { color: var(--red); border-color: var(--red); }
@@ -119,6 +120,12 @@
   }
   .nodetail { color: var(--dim); font-size: 13px; padding: 8px 2px; }
   .retryrow { display: flex; gap: 8px; padding: 0 14px 12px; }
+
+  .planrow { border: 1px solid var(--border); border-radius: 10px; background: var(--panel); margin-bottom: 10px; padding: 10px 12px; }
+  .planrow .top { display: flex; align-items: center; gap: 8px; }
+  .planrow .num { color: var(--dim); font: 12px var(--mono); min-width: 24px; }
+  .planrow .title { flex: 1; }
+  .planrow .desc { margin-top: 8px; }
 </style>
 </head>
 <body>
@@ -195,6 +202,7 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 let selectedRun = null;
+let selectedStatus = null;     // last observed status of the selected run
 let es = null;                 // active EventSource
 let live = false;              // is the selected run actively running?
 
@@ -274,9 +282,16 @@ async function loadRuns() {
 
 async function selectRun(id) {
   selectedRun = id;
-  setLive(false);
   const data = await api("/api/runs/" + id);
+  selectedStatus = data.status;
   renderRun(data);
+  if (data.running) {
+    setLive(true);
+    openSSE(id);
+  } else {
+    setLive(false);
+    if (es) { es.close(); es = null; }
+  }
   loadRuns();
 }
 
@@ -334,15 +349,129 @@ function renderRun(data) {
   d.appendChild(head);
 
   // tasks
-  if (!data.tasks || !data.tasks.length) {
-    const e = document.createElement("div");
-    e.className = "nodetail";
-    e.textContent = data.status === "queued" || data.status === "planning"
-      ? "planning tasks… (logs appear once the planner returns)"
-      : "no tasks recorded";
-    d.appendChild(e);
+  if (data.status === "awaiting_approval") {
+    d.appendChild(planReview(data));
+  } else {
+    if (!data.tasks || !data.tasks.length) {
+      const e = document.createElement("div");
+      e.className = "nodetail";
+      e.textContent = data.status === "queued" || data.status === "planning"
+        ? "planning tasks… (logs appear once the planner returns)"
+        : "no tasks recorded";
+      d.appendChild(e);
+    }
+    for (const t of data.tasks) d.appendChild(taskRow(t));
   }
-  for (const t of data.tasks) d.appendChild(taskRow(t));
+}
+
+// ---- plan review / edit / approve ------------------------------------------
+
+function planReview(data) {
+  const wrap = document.createElement("div");
+
+  const intro = document.createElement("div");
+  intro.className = "nodetail";
+  intro.textContent = "ralph proposed the plan below — edit, add or remove tasks, then approve to start or reject to cancel.";
+  wrap.appendChild(intro);
+
+  const list = document.createElement("div");
+  list.className = "planlist";
+  wrap.appendChild(list);
+
+  const renumber = () => {
+    list.querySelectorAll(".planrow .num").forEach((n, i) => { n.textContent = (i + 1) + "."; });
+  };
+  const addRow = (t) => {
+    const row = document.createElement("div");
+    row.className = "planrow";
+    const top = document.createElement("div");
+    top.className = "top";
+    const num = document.createElement("span");
+    num.className = "num";
+    const ti = document.createElement("input");
+    ti.type = "text"; ti.className = "title"; ti.placeholder = "task title";
+    ti.value = t ? (t.title || "") : "";
+    const rm = document.createElement("button");
+    rm.type = "button"; rm.className = "ghost"; rm.textContent = "remove";
+    rm.onclick = () => { row.remove(); renumber(); };
+    top.append(num, ti, rm);
+    const de = document.createElement("textarea");
+    de.className = "desc"; de.placeholder = "what should this task accomplish?";
+    de.value = t ? (t.description || "") : "";
+    row.append(top, de);
+    list.appendChild(row);
+    renumber();
+  };
+  (data.tasks || []).forEach(addRow);
+
+  const lc = document.createElement("label");
+  lc.textContent = "test cmd";
+  const tc = document.createElement("input");
+  tc.type = "text"; tc.placeholder = "planner's choice";
+  tc.value = data.plan_test_cmd || ((data.params || {}).test_cmd) || "";
+  wrap.append(lc, tc);
+
+  const err = document.createElement("div");
+  err.className = "formerr";
+  wrap.appendChild(err);
+
+  const row = document.createElement("div");
+  row.className = "startrow";
+  const add = document.createElement("button");
+  add.type = "button"; add.className = "ghost"; add.textContent = "Add task";
+  add.style.flex = "0";
+  add.onclick = () => addRow(null);
+  const approve = document.createElement("button");
+  approve.type = "button"; approve.textContent = "Approve and start";
+  const reject = document.createElement("button");
+  reject.type = "button"; reject.className = "danger"; reject.textContent = "Reject";
+  row.append(approve, reject, add);
+  wrap.appendChild(row);
+
+  const setBusy = (on) => { approve.disabled = reject.disabled = add.disabled = on; };
+  const fail = (e) => { err.textContent = e.message; setBusy(false); };
+
+  // initial snapshot for the change-detection (PUT the plan only if edited)
+  const initTasks = (data.tasks || []).map((t) => [t.title, t.description]);
+  const initTest = data.plan_test_cmd || ((data.params || {}).test_cmd) || "";
+
+  approve.onclick = async () => {
+    err.textContent = "";
+    const tasks = [...list.querySelectorAll(".planrow")].map((r, i) => ({
+      task_id: i + 1,
+      title: r.querySelector(".title").value.trim(),
+      description: r.querySelector(".desc").value.trim(),
+    }));
+    const test_cmd = tc.value.trim();
+    if (!tasks.length) { err.textContent = "the plan needs at least one task"; return; }
+    if (tasks.some((t) => !t.title || !t.description)) {
+      err.textContent = "every task needs a title and a description"; return;
+    }
+    setBusy(true);
+    try {
+      const same = test_cmd === initTest &&
+        JSON.stringify(tasks.map(({ title, description }) => [title, description])) ===
+        JSON.stringify(initTasks);
+      if (!same) {
+        await api(`/api/runs/${data.id}/plan`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ tasks, test_cmd: test_cmd || null }),
+        });
+      }
+      await api(`/api/runs/${data.id}/approve`, { method: "POST" });
+      selectRun(data.id);
+    } catch (e) { fail(e); }
+  };
+  reject.onclick = async () => {
+    err.textContent = "";
+    setBusy(true);
+    try {
+      await api(`/api/runs/${data.id}/reject`, { method: "POST" });
+      selectRun(data.id);
+    } catch (e) { fail(e); }
+  };
+  return wrap;
 }
 
 function taskRow(t) {
@@ -464,6 +593,10 @@ function openSSE(id) {
       if (row && selectedRun === id) {
         row.replaceWith(taskRow(data));
       }
+    } else if (name === "planned") {
+      // Planner finished (or the plan was re-saved): the run is now
+      // awaiting approval — re-render the detail as a plan review.
+      if (selectedRun === id) selectRun(id).catch(() => {});
     } else if (name === "step") {
       const row = document.querySelector(`.taskrow.open[data-tid="${data.task_id}"]`);
       const box = row && row.querySelector(".steps");
@@ -532,7 +665,14 @@ $("newrun").addEventListener("submit", async (e) => {
     $("dbpath").textContent = h.db;
   } catch {}
   await loadRuns();
-  setInterval(loadRuns, 4000);
+  setInterval(() => {
+    loadRuns();
+    // Keep the detail in sync while the planner works, so the run flips
+    // from 'planning tasks…' to the plan review the moment it lands.
+    if (selectedRun && (selectedStatus === "queued" || selectedStatus === "planning")) {
+      selectRun(selectedRun).catch(() => {});
+    }
+  }, 4000);
 })();
 </script>
 </body>
