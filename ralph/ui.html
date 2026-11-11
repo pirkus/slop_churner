@@ -79,6 +79,9 @@
   .pill.pending, .pill.queued, .pill.cancelled { color: var(--dim); border-color: var(--dim); }
   .pill.planning, .pill.pr { color: var(--accent); border-color: var(--accent); }
   .pill.awaiting_approval { color: var(--amber); border-color: var(--amber); }
+  .pill.awaiting_acceptance { color: #b085f5; border-color: #b085f5; }
+  .pill.accepted { color: var(--green); border-color: var(--green); }
+  .pill.rejected { color: var(--red); border-color: var(--red); }
   .pill.implementing, .pill.testing, .pill.fixing, .pill.running { color: var(--amber); border-color: var(--amber); }
   .pill.done { color: var(--green); border-color: var(--green); }
   .pill.failed, .pill.error { color: var(--red); border-color: var(--red); }
@@ -120,6 +123,26 @@
   }
   .nodetail { color: var(--dim); font-size: 13px; padding: 8px 2px; }
   .retryrow { display: flex; gap: 8px; padding: 0 14px 12px; }
+
+  /* diff review */
+  .difftitle { font-weight: 600; margin-bottom: 6px; }
+  .diffstat { color: var(--dim); font: 12px var(--mono); margin-bottom: 10px; }
+  .diffstat b.add { color: var(--green); font-weight: 600; }
+  .diffstat b.del { color: var(--red); font-weight: 600; }
+  .diffrow { border: 1px solid var(--border); border-radius: 8px; background: var(--panel); margin-bottom: 8px; overflow: hidden; }
+  .diffhead { display: flex; align-items: center; gap: 10px; padding: 9px 12px; cursor: pointer; }
+  .diffhead:hover { background: var(--panel2); }
+  .diffhead .path { font: 13px var(--mono); flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .diffhead .add { color: var(--green); font: 12px var(--mono); }
+  .diffhead .del { color: var(--red); font: 12px var(--mono); }
+  .diffhead .chev { color: var(--dim); transition: transform .15s; }
+  .diffrow.open .chev { transform: rotate(90deg); }
+  .diffpatch { border-top: 1px solid var(--border); margin: 0; padding: 8px 0; background: var(--bg); max-height: 420px; overflow: auto; }
+  .diffpatch .dl { font: 12px/1.55 var(--mono); padding: 0 14px; white-space: pre; }
+  .diffpatch .dl.add { background: rgba(63,185,111,.12); color: #8fd8a8; }
+  .diffpatch .dl.del { background: rgba(229,83,75,.12); color: #e89a94; }
+  .diffpatch .dl.hunk { color: var(--accent); background: rgba(90,169,255,.07); }
+  .diffpatch .dl.meta { color: var(--dim); }
 
   .planrow { border: 1px solid var(--border); border-radius: 10px; background: var(--panel); margin-bottom: 10px; padding: 10px 12px; }
   .planrow .top { display: flex; align-items: center; gap: 8px; }
@@ -352,6 +375,15 @@ function renderRun(data) {
   if (data.status === "awaiting_approval") {
     d.appendChild(planReview(data));
   } else {
+    if (data.status === "awaiting_acceptance") d.appendChild(diffReview(data.id));
+    if (data.status === "accepted" || data.status === "rejected") {
+      const e = document.createElement("div");
+      e.className = "nodetail";
+      e.textContent = data.status === "accepted"
+        ? "accepted — staged changes were merged into the base branch"
+        : "rejected — the staged changes were discarded";
+      d.appendChild(e);
+    }
     if (!data.tasks || !data.tasks.length) {
       const e = document.createElement("div");
       e.className = "nodetail";
@@ -362,6 +394,124 @@ function renderRun(data) {
     }
     for (const t of data.tasks) d.appendChild(taskRow(t));
   }
+}
+
+// ---- diff review / accept / reject -----------------------------------------
+
+function diffReview(id) {
+  const wrap = document.createElement("div");
+  wrap.className = "diffwrap";
+
+  const title = document.createElement("div");
+  title.className = "difftitle";
+  title.textContent = "ralph finished — review the changes before accepting";
+  wrap.appendChild(title);
+
+  const stat = document.createElement("div");
+  stat.className = "diffstat";
+  esc(stat, "loading diff…");
+  wrap.appendChild(stat);
+
+  const files = document.createElement("div");
+  wrap.appendChild(files);
+
+  const err = document.createElement("div");
+  err.className = "formerr";
+  wrap.appendChild(err);
+
+  const row = document.createElement("div");
+  row.className = "startrow";
+  const accept = document.createElement("button");
+  accept.type = "button"; accept.textContent = "Accept — merge into base";
+  const reject = document.createElement("button");
+  reject.type = "button"; reject.className = "danger"; reject.textContent = "Reject — discard changes";
+  row.append(accept, reject);
+  wrap.appendChild(row);
+
+  const setBusy = (on) => { accept.disabled = reject.disabled = on; };
+
+  const doAction = async (action) => {
+    err.textContent = "";
+    setBusy(true);
+    try {
+      await api(`/api/runs/${id}/${action}`, { method: "POST" });
+      await selectRun(id);
+    } catch (e) {
+      err.textContent = e.message;
+      setBusy(false);
+    }
+  };
+  accept.onclick = () => {
+    if (confirm("Merge the staged changes into the base branch?\n(This deletes the staging branch.)")) doAction("accept");
+  };
+  reject.onclick = () => {
+    if (confirm("Discard ALL staged changes from this run?\n(This cannot be undone.)")) doAction("discard");
+  };
+
+  api(`/api/runs/${id}/diff`).then((d) => {
+    stat.textContent = "";
+    const n = document.createElement("b");
+    n.className = "add"; n.textContent = `+${d.added}`;
+    const m = document.createElement("b");
+    m.className = "del"; m.textContent = `-${d.deleted}`;
+    const s = document.createElement("span");
+    esc(s, `  ${d.stat}`);
+    stat.append(n, m, s);
+    for (const f of d.files) files.appendChild(diffFileRow(f));
+    if (!d.files.length) {
+      const e = document.createElement("div");
+      e.className = "nodetail";
+      e.textContent = "no file changes detected";
+      files.appendChild(e);
+    }
+  }).catch((e) => { err.textContent = e.message; });
+
+  return wrap;
+}
+
+function diffFileRow(f) {
+  const rowEl = document.createElement("div");
+  rowEl.className = "diffrow";
+  const head = document.createElement("div");
+  head.className = "diffhead";
+  const chev = document.createElement("span");
+  chev.className = "chev"; chev.textContent = "▸";
+  const path = document.createElement("span");
+  path.className = "path"; esc(path, f.path);
+  const add = document.createElement("span");
+  add.className = "add"; esc(add, "+" + f.added);
+  const del = document.createElement("span");
+  del.className = "del"; esc(del, "-" + f.deleted);
+  head.append(chev, path, add, del);
+  rowEl.appendChild(head);
+
+  const pre = document.createElement("pre");
+  pre.className = "diffpatch";
+  pre.style.display = "none";
+  rowEl.appendChild(pre);
+
+  let loaded = false;
+  head.onclick = () => {
+    rowEl.classList.toggle("open");
+    const open = rowEl.classList.contains("open");
+    pre.style.display = open ? "" : "none";
+    if (open && !loaded) {
+      loaded = true;
+      for (const line of (f.patch || "(no patch)").split("\n")) {
+        const dl = document.createElement("div");
+        dl.className = "dl";
+        if (line.startsWith("+")) dl.classList.add("add");
+        else if (line.startsWith("-")) dl.classList.add("del");
+        else if (line.startsWith("@@")) dl.classList.add("hunk");
+        else if (line.startsWith("diff ") || line.startsWith("index ")
+              || line.startsWith("new file") || line.startsWith("deleted file")
+              || line.startsWith("--- ") || line.startsWith("+++ ")) dl.classList.add("meta");
+        esc(dl, line);
+        pre.appendChild(dl);
+      }
+    }
+  };
+  return rowEl;
 }
 
 // ---- plan review / edit / approve ------------------------------------------
@@ -669,7 +819,8 @@ $("newrun").addEventListener("submit", async (e) => {
     loadRuns();
     // Keep the detail in sync while the planner works, so the run flips
     // from 'planning tasks…' to the plan review the moment it lands.
-    if (selectedRun && (selectedStatus === "queued" || selectedStatus === "planning")) {
+    if (selectedRun && (selectedStatus === "queued" || selectedStatus === "planning"
+                        || selectedStatus === "running")) {
       selectRun(selectedRun).catch(() => {});
     }
   }, 4000);

@@ -25,6 +25,31 @@ def _cfg(args: argparse.Namespace) -> Config:
     )
 
 
+def _review_gate(cfg: Config, state: State, auto_yes: bool = False) -> str:
+    """Present the staged diff and ask whether to accept or reject.
+
+    Returns "accept", "reject" or "keep" (no decision; staging branch kept).
+    """
+    review = gitutil.diff_overview(cfg.repo, state.base_branch, state.run_branch)
+    print(f"\nchanges staged on '{state.run_branch}' "
+          f"(not yet in {state.base_branch}):")
+    print(f"  {review['stat']}")
+    for f in review["files"]:
+        print(f"    {f['path']}  (+{f['added']} -{f['deleted']})")
+    if auto_yes:
+        return "accept"
+    try:
+        ans = input(f"accept changes into {state.base_branch}? "
+                    f"[a]ccept / [r]eject / [Enter] keep for later: ").strip().lower()
+    except EOFError:
+        ans = ""
+    if ans.startswith("a"):
+        return "accept"
+    if ans.startswith("r"):
+        return "reject"
+    return "keep"
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     cfg = _cfg(args)
     if not args.request:
@@ -43,7 +68,25 @@ def cmd_run(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         only=args.task,
     )
-    return 0 if report.all_done else 1
+    ok = bool(report.all_done)
+    # Acceptance gate: work is staged on the run branch, not in base yet.
+    if not args.dry_run and report.done and cfg.run_branch:
+        state = State.load(cfg.state_path) or State(
+            prompt=args.request, base_branch=cfg.base_branch or "main", test_cmd=None)
+        if not state.run_branch:
+            state.run_branch = cfg.run_branch
+        decision = _review_gate(cfg, state, auto_yes=args.yes)
+        if decision == "accept":
+            engine.accept_run(cfg, state)
+            print(f"accepted: staged changes merged into {state.base_branch}")
+        elif decision == "reject":
+            engine.reject_run(cfg, state)
+            print(f"rejected: staging branch {cfg.run_branch} discarded")
+        else:
+            print(f"kept for later: review with `ralph accept` or `ralph reject` "
+                  f"(staging branch {cfg.run_branch})")
+            ok = True  # the work is done; the decision is simply pending
+    return 0 if ok else 1
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -81,6 +124,35 @@ def cmd_retry(args: argparse.Namespace) -> int:
     state.save(cfg.state_path)
     report = engine.run(cfg, state.prompt, only=args.task, dry_run=args.dry_run)
     return 0 if report.all_done else 1
+
+
+def _simple_cfg(args: argparse.Namespace) -> Config:
+    """Minimal config for accept/reject: only repo + base matter."""
+    return Config(repo=Path(args.repo), base_branch=args.base)
+
+
+def cmd_accept(args: argparse.Namespace) -> int:
+    cfg = _simple_cfg(args)
+    state = State.load(cfg.state_path)
+    if state is None:
+        print("no state found; nothing to accept")
+        return 1
+    branch = state.run_branch
+    engine.accept_run(cfg, state)
+    print(f"accepted: {branch} merged into {state.base_branch}")
+    return 0
+
+
+def cmd_reject(args: argparse.Namespace) -> int:
+    cfg = _simple_cfg(args)
+    state = State.load(cfg.state_path)
+    if state is None:
+        print("no state found; nothing to reject")
+        return 1
+    branch = state.run_branch
+    engine.reject_run(cfg, state)
+    print(f"rejected: staging branch {branch} discarded")
+    return 0
 
 
 def cmd_tasks(args: argparse.Namespace) -> int:
@@ -152,8 +224,22 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("request", nargs="?", help="what to build (or edit .ralph/PROMPT.md)")
     sp.add_argument("--task", type=int, default=None, help="run only this task id")
     sp.add_argument("--force-plan", action="store_true", help="re-plan even if state exists")
+    sp.add_argument("--yes", action="store_true",
+                    help="auto-accept the staged changes at the end (no prompt)")
     common(sp)
     sp.set_defaults(func=cmd_run)
+
+    sp = sub.add_parser("accept", help="merge the staged run into the base branch")
+    sp.add_argument("--repo", default=".", help="target git repository (default: .)")
+    sp.add_argument("--base", default=None,
+                    help="base branch (default: repo's current branch)")
+    sp.set_defaults(func=cmd_accept)
+
+    sp = sub.add_parser("reject", help="discard the staged run (staging branch + worktrees)")
+    sp.add_argument("--repo", default=".", help="target git repository (default: .)")
+    sp.add_argument("--base", default=None,
+                    help="base branch (default: repo's current branch)")
+    sp.set_defaults(func=cmd_reject)
 
     sp = sub.add_parser("status", help="show current state and task progress")
     common(sp)

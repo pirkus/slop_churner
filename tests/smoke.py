@@ -102,20 +102,72 @@ def main() -> int:
     assert report.all_done, "expected all tasks to complete"
     assert len(report.done) == 1
 
-    # The change must be merged into main in the base repo.
-    sh(repo, "git", "log", "--oneline", "-5")
-    main_has_sub = "def subtract" in (repo / "app.py").read_text()
-    assert main_has_sub, "subtract should be merged into main"
+    # The change must be STAGED on the run branch, not yet in main.
+    branches = subprocess.run(["git", "branch"], cwd=str(repo),
+                              capture_output=True, text=True).stdout
+    assert "ralph/run" in branches, f"staging branch should exist:\n{branches}"
+    sh(repo, "git", "checkout", "ralph/run")
+    staged = "def subtract" in (repo / "app.py").read_text()
+    assert staged, "subtract should be staged on the run branch"
+    sh(repo, "git", "checkout", "main")
+    assert "def subtract" not in (repo / "app.py").read_text(), \
+        "main must stay clean until the run is accepted"
 
-    # No leftover worktrees.
+    # Accept the run: work lands in main, staging + task branches cleaned up.
+    from ralph import engine
+    from ralph.state import State
+    state = State.load(cfg.state_path)
+    assert state is not None and state.run_branch == "ralph/run", \
+        "state must record the staging branch"
+    engine.accept_run(cfg, state)
+    assert "def subtract" in (repo / "app.py").read_text(), \
+        "subtract should be merged into main after accept"
+    sh(repo, "git", "log", "--oneline", "-5")
+
+    # No leftover worktrees or ralph branches.
     wts = subprocess.run(["git", "worktree", "list"], cwd=str(repo),
                          capture_output=True, text=True).stdout
     assert wts.count("\n") <= 1, f"expected no extra worktrees, got:\n{wts}"
-
-    # The task branch should have been deleted after merge.
     branches = subprocess.run(["git", "branch"], cwd=str(repo),
                               capture_output=True, text=True).stdout
-    assert "ralph/" not in branches, f"task branch should be deleted:\n{branches}"
+    assert "ralph/" not in branches, f"branches should be cleaned up:\n{branches}"
+    assert state.run_branch is None, "state must clear run_branch after accept"
+
+    # Reject path on a fresh repo: staging work is discarded, base untouched.
+    tmp2 = Path(tempfile.mkdtemp(prefix="ralph-smoke-reject-"))
+    repo2 = tmp2 / "proj"
+    repo2.mkdir()
+    make_repo(repo2)
+    cfg2 = Config(repo=repo2, base_branch="main", agent_cmd="pi",
+                  max_iterations=3, test_cmd="true")
+    planner.run_agent = stub
+    runner.run_agent = stub
+    stub_tests.n = 1  # start green
+    r2 = run(cfg2, "add a subtract function")
+    assert r2.all_done
+    state2 = State.load(cfg2.state_path)
+    assert state2.run_branch == "ralph/run"
+
+    # diff_overview should report the staged change while it is pending.
+    from ralph import gitutil
+    ov = gitutil.diff_overview(repo2, "main", "ralph/run")
+    assert any(f["path"] == "app.py" and f["added"] > 0 for f in ov["files"]), ov
+    assert ov["added"] > 0 and ov["deleted"] >= 0
+    assert any("app.py" in f["patch"] for f in ov["files"] if f["patch"])
+    assert ov["commits"], "commit list should not be empty"
+    # Missing-branch path degrades gracefully.
+    ov2 = gitutil.diff_overview(repo2, "main", "ralph/nope")
+    assert ov2["files"] == [] and ov2["added"] == 0
+
+    engine.reject_run(cfg2, state2)
+    branches = subprocess.run(["git", "branch"], cwd=str(repo2),
+                              capture_output=True, text=True).stdout
+    assert "ralph/" not in branches, f"staging branch should be gone:\n{branches}"
+    assert "def subtract" not in (repo2 / "app.py").read_text(), \
+        "main must be untouched after reject"
+    wts = subprocess.run(["git", "worktree", "list"], cwd=str(repo2),
+                         capture_output=True, text=True).stdout
+    assert wts.count("\n") <= 1, f"worktrees should be cleaned up, got:\n{wts}"
 
     print("\nSMOKE TEST PASSED")
     return 0
@@ -176,21 +228,34 @@ def main_plan_supplied() -> int:
     assert len(report.done) == 2
     assert [t.id for t in report.done] == [1, 2]
 
-    # Both supplied tasks must have been executed and merged into main.
-    sh(repo, "git", "log", "--oneline", "-5")
+    # Both supplied tasks must be staged on the run branch...
+    branches = subprocess.run(["git", "branch"], cwd=str(repo),
+                              capture_output=True, text=True).stdout
+    assert "ralph/run" in branches, f"staging branch should exist:\n{branches}"
+    sh(repo, "git", "checkout", "ralph/run")
+    staged_src = (repo / "app.py").read_text()
+    assert "def subtract" in staged_src and "def multiply" in staged_src, \
+        "both supplied tasks should be staged on the run branch"
+    sh(repo, "git", "checkout", "main")
+    assert "def subtract" not in (repo / "app.py").read_text(), \
+        "main must stay clean until accept"
+
+    # ...and accept lands both in main (task 2 built on task 1's work).
+    from ralph import engine
+    from ralph.state import State
+    state = State.load(cfg.state_path)
+    engine.accept_run(cfg, state)
     main_src = (repo / "app.py").read_text()
     assert "def subtract" in main_src and "def multiply" in main_src, \
-        "both supplied tasks should be merged into main"
+        "both supplied tasks should be merged into main after accept"
 
-    # No leftover worktrees.
+    # No leftover worktrees or branches.
     wts = subprocess.run(["git", "worktree", "list"], cwd=str(repo),
                          capture_output=True, text=True).stdout
     assert wts.count("\n") <= 1, f"expected no extra worktrees, got:\n{wts}"
-
-    # Task branches should have been deleted after merge.
     branches = subprocess.run(["git", "branch"], cwd=str(repo),
                               capture_output=True, text=True).stdout
-    assert "ralph/" not in branches, f"task branches should be deleted:\n{branches}"
+    assert "ralph/" not in branches, f"branches should be cleaned up:\n{branches}"
 
     print("\nSMOKE TEST (pre-supplied plan) PASSED")
     return 0

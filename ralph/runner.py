@@ -52,31 +52,37 @@ def run_tests(cfg: Config, wt: Path, test_cmd: str | None) -> StageResult:
 
 
 def open_pr(cfg: Config, state: State, task: Task, wt: Path) -> StageResult:
-    """Local PR: commit, best-effort push, merge into base. Aborts on conflict."""
+    """Local PR: commit, best-effort push, merge into the run's staging branch.
+
+    The base branch is only touched later, when the user accepts the run.
+    """
     try:
         if not gitutil.commit_all(wt, f"{task.title} (ralph task {task.id})"):
             # Nothing new this iteration; the branch may already hold earlier work.
             pass
+        target = cfg.run_branch or state.base_branch
         note = None
         if gitutil.has_remote(wt):
-            note = gitutil.push(wt, task.branch or "")
-        # Merge into the base branch in the main repo.
-        gitutil.merge_into_base(cfg.repo, task.branch or "", state.base_branch,
-                                f"ralph: {task.title}")
+            note = gitutil.push(wt, target)
+        # Merge into the staging branch in the main repo.
+        gitutil.merge_into(cfg.repo, task.branch or "", target,
+                           f"ralph: {task.title}")
         extra = f"\n{note}" if note else ""
-        return StageResult(True, f"merged {task.branch} into {state.base_branch}{extra}", 0)
+        return StageResult(True, f"merged {task.branch} into {target}{extra}", 0)
     except gitutil.GitError as exc:
-        # Abort a half-finished merge so base is left clean for the fix attempt.
-        _abort_merge(cfg.repo, state.base_branch)
+        # Abort a half-finished merge so the staging branch is clean for the
+        # next fix attempt.
+        _abort_merge(cfg.repo, cfg.run_branch or state.base_branch)
         return StageResult(False, f"PR/merge failed: {exc}", 1)
 
 
-def _abort_merge(repo: Path, base: str) -> None:
+def _abort_merge(repo: Path, target: str) -> None:
     import subprocess
     subprocess.run(["git", "merge", "--abort"], cwd=str(repo),
                    capture_output=True, text=True)
-    # Make sure we are back on base and clean.
-    subprocess.run(["git", "checkout", base], cwd=str(repo), capture_output=True, text=True)
+    # Make sure we are back on the target branch and clean.
+    subprocess.run(["git", "checkout", target], cwd=str(repo),
+                   capture_output=True, text=True)
 
 
 def _worktree_path(cfg: Config, task: Task) -> Path:
@@ -103,8 +109,9 @@ def run_task(
     # Ensure base branch is checked out and clean before we branch off it.
     _prepare_base(cfg.repo, state.base_branch)
 
-    # Create (or reuse) a dedicated worktree + branch for this task.
-    gitutil.worktree_add(cfg.repo, wt, task.branch, state.base_branch)
+    # Create (or reuse) a dedicated worktree + branch for this task,
+    # branching off the staging tip so later tasks see earlier work.
+    gitutil.worktree_add(cfg.repo, wt, task.branch, cfg.run_branch or state.base_branch)
 
     committed_any = False
     last_error = ""
@@ -179,11 +186,13 @@ def run_task(
         task.mark(Status.PR)
         _save(state, cfg)
         emit_task()
-        print(f"    pr: commit + merge {task.branch} → {state.base_branch}…", flush=True)
+        print(f"    pr: commit + merge {task.branch} → "
+              f"{cfg.run_branch or state.base_branch}…", flush=True)
         t0 = time.time()
         pr = open_pr(cfg, state, task, wt)
         _log(cfg, task, "pr", pr.output)
-        print(f"    pr: {'MERGED' if pr.ok else 'FAILED'}", flush=True)
+        print(f"    pr: {'MERGED' if pr.ok else 'FAILED'} "
+          f"(staged on {cfg.run_branch or state.base_branch})", flush=True)
         emit("step", {
             "task_id": task.id, "iteration": attempt, "stage": "pr",
             "ok": pr.ok, "output": pr.output,

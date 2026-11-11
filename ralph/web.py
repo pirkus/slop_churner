@@ -24,9 +24,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from . import __version__, engine, events, planner
+from . import __version__, engine, events, gitutil, planner
 from .config import Config
 from .errors import RalphError
+from .state import State
 from .store import Store, default_db_path
 
 # ---------------------------------------------------------------------------
@@ -150,6 +151,9 @@ def _worker(ctx: "ServerContext", run_id: int, params: dict[str, Any],
     try:
         ctx.store.set_run_status(run_id, "running")
         cfg = _build_cfg(params)
+        # This run's work is staged on its own branch; the base branch is
+        # only touched when the user accepts the finished run.
+        cfg.run_branch = gitutil.run_branch_name(run_id)
         plan = None
         if only_task is None:
             # Fresh execution: build the plan from the stored, approved
@@ -175,8 +179,10 @@ def _worker(ctx: "ServerContext", run_id: int, params: dict[str, Any],
         )
         if cancel.is_set():
             _close("cancelled", None)
-        elif report.all_done:
-            _close("done", None)
+        elif report.done:
+            # Work is staged on ralph/run-<id>; park until the user accepts
+            # or rejects it. The repo claim stays held until then.
+            _close("awaiting_acceptance", None)
         else:
             _close("failed", None)
     except (RalphError, ValueError, OSError) as exc:
@@ -187,7 +193,9 @@ def _worker(ctx: "ServerContext", run_id: int, params: dict[str, Any],
         _close("error", f"internal error: {exc}")
     finally:
         ctx.workers.pop(run_id, None)
-        ctx.release_repo(params.get("repo") or ".", run_id)
+        row = ctx.store.get_run(run_id)
+        if row is None or row["status"] != "awaiting_acceptance":
+            ctx.release_repo(params.get("repo") or ".", run_id)
 
 
 class ServerContext:
@@ -281,6 +289,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._get_run(int(m.group(1)))
             elif m := re.fullmatch(r"/api/runs/(\d+)/tasks/(\d+)", path):
                 self._get_task(int(m.group(1)), int(m.group(2)))
+            elif m := re.fullmatch(r"/api/runs/(\d+)/diff", path):
+                self._diff(int(m.group(1)))
             elif m := re.fullmatch(r"/api/runs/(\d+)/events", path):
                 self._sse(int(m.group(1)))
             else:
@@ -299,6 +309,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._approve(int(m.group(1)))
             elif m := re.fullmatch(r"/api/runs/(\d+)/reject", path):
                 self._reject(int(m.group(1)))
+            elif m := re.fullmatch(r"/api/runs/(\d+)/accept", path):
+                self._accept_run(int(m.group(1)))
+            elif m := re.fullmatch(r"/api/runs/(\d+)/discard", path):
+                self._discard_run(int(m.group(1)))
             elif m := re.fullmatch(r"/api/runs/(\d+)/retry/(\d+)", path):
                 self._retry(int(m.group(1)), int(m.group(2)))
             else:
@@ -456,6 +470,96 @@ class Handler(BaseHTTPRequestHandler):
         steps = self.ctx.store.get_steps(run_id, task_id)
         self._json(200, {"task": task, "steps": steps, "running": run_id in self.ctx.workers})
 
+    def _diff(self, run_id: int) -> None:
+        row = self.ctx.store.get_run(run_id)
+        if row is None:
+            self._json(404, {"error": "no such run"})
+            return
+        params = {**row["params"], "prompt": row["prompt"]}
+        try:
+            cfg = _build_cfg(params)
+        except RalphError as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        branch = gitutil.run_branch_name(run_id)
+        if not gitutil.branch_exists(cfg.repo, branch):
+            self._json(404, {"error": f"staging branch {branch} not found "
+                                     "(run may not have staged any work)"})
+            return
+        d = gitutil.diff_overview(cfg.repo, cfg.base_branch, branch)
+        d["run_branch"] = branch
+        d["base_branch"] = cfg.base_branch
+        d["tasks"] = self.ctx.store.get_tasks(run_id)
+        self._json(200, d)
+
+    def _accept_run(self, run_id: int) -> None:
+        row = self.ctx.store.get_run(run_id)
+        if row is None:
+            self._json(404, {"error": "no such run"})
+            return
+        if row["status"] != "awaiting_acceptance":
+            self._json(409, {"error": "run is not awaiting acceptance "
+                                     f"(status: {row['status']})"})
+            return
+        repo = row["repo"]
+        # Another active run may have taken the repo in the meantime.
+        conflict = self.ctx.claim_repo(repo, run_id)
+        if conflict is not None and conflict != run_id:
+            self._json(409, {"error": f"repo already in use by run {conflict}"})
+            return
+        params = {**row["params"], "prompt": row["prompt"]}
+        try:
+            cfg = _build_cfg(params)
+            cfg.run_branch = gitutil.run_branch_name(run_id)
+            state = State.load(cfg.state_path)
+            if state is None or not state.run_branch:
+                state = State(prompt=row["prompt"], base_branch=cfg.base_branch,
+                              test_cmd=None, run_branch=cfg.run_branch)
+            else:
+                state.run_branch = cfg.run_branch
+            engine.accept_run(cfg, state)
+        except (RalphError, OSError) as exc:
+            self._json(409, {"error": f"accept failed: {exc}"})
+            return
+        self.ctx.store.finish_run(run_id, "accepted", None)
+        self.ctx.release_repo(repo, run_id)
+        self.ctx.hub.publish(run_id, {"name": "closed", "data": {"status": "accepted", "error": None}})
+        self._json(200, {"ok": True, "status": "accepted"})
+
+    def _discard_run(self, run_id: int) -> None:
+        """Reject the finished run: discard its staging branch + worktrees."""
+        row = self.ctx.store.get_run(run_id)
+        if row is None:
+            self._json(404, {"error": "no such run"})
+            return
+        if row["status"] != "awaiting_acceptance":
+            self._json(409, {"error": "run is not awaiting acceptance "
+                                     f"(status: {row['status']})"})
+            return
+        repo = row["repo"]
+        conflict = self.ctx.claim_repo(repo, run_id)
+        if conflict is not None and conflict != run_id:
+            self._json(409, {"error": f"repo already in use by run {conflict}"})
+            return
+        params = {**row["params"], "prompt": row["prompt"]}
+        try:
+            cfg = _build_cfg(params)
+            cfg.run_branch = gitutil.run_branch_name(run_id)
+            state = State.load(cfg.state_path)
+            if state is None or not state.run_branch:
+                state = State(prompt=row["prompt"], base_branch=cfg.base_branch,
+                              test_cmd=None, run_branch=cfg.run_branch)
+            else:
+                state.run_branch = cfg.run_branch
+            engine.reject_run(cfg, state)
+        except (RalphError, OSError) as exc:
+            self._json(409, {"error": f"discard failed: {exc}"})
+            return
+        self.ctx.store.finish_run(run_id, "rejected", None)
+        self.ctx.release_repo(repo, run_id)
+        self.ctx.hub.publish(run_id, {"name": "closed", "data": {"status": "rejected", "error": None}})
+        self._json(200, {"ok": True, "status": "rejected"})
+
     def _cancel(self, run_id: int) -> None:
         cancel = self.ctx.workers.get(run_id)
         if cancel is None:
@@ -474,6 +578,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if row["status"] == "awaiting_approval":
             self._json(409, {"error": "approve or reject the plan before retrying"})
+            return
+        if row["status"] == "awaiting_acceptance":
+            self._json(409, {"error": "accept or reject the staged run before retrying"})
             return
         task = next((t for t in self.ctx.store.get_tasks(run_id) if t["task_id"] == task_id), None)
         if task is None:

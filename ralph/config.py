@@ -9,6 +9,7 @@ from pathlib import Path
 class Config:
     repo: Path
     base_branch: str | None = None  # None = auto-detect current branch
+    run_branch: str | None = None   # staging branch; tasks merge here (default "ralph/run")
     agent_cmd: str = os.environ.get("RALPH_AGENT", "pi")
     model: str | None = None
     max_iterations: int = 3          # implement/test/PR attempts per task

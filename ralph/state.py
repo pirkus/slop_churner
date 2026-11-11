@@ -60,6 +60,7 @@ class State:
     prompt: str
     base_branch: str
     test_cmd: str | None
+    run_branch: str | None = None  # staging branch this run's tasks merge into
     tasks: list[Task] = field(default_factory=list)
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
@@ -74,6 +75,7 @@ class State:
             prompt=raw.get("prompt", ""),
             base_branch=raw.get("base_branch", "main"),
             test_cmd=raw.get("test_cmd"),
+            run_branch=raw.get("run_branch"),
             tasks=tasks,
             created_at=raw.get("created_at", _now()),
             updated_at=raw.get("updated_at", _now()),
@@ -86,6 +88,7 @@ class State:
             "prompt": self.prompt,
             "base_branch": self.base_branch,
             "test_cmd": self.test_cmd,
+            "run_branch": self.run_branch,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "tasks": [t.to_dict() for t in self.tasks],

@@ -8,6 +8,7 @@ Run:  python3 tests/web_smoke.py
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import threading
@@ -128,6 +129,9 @@ def main() -> int:
         "awaiting_approval", "planReview", "Add task", "Approve and start",
         "Reject", "remove", 'plan_test_cmd', 'method: "PUT"',
         "/plan", "/approve", "/reject", 'name === "planned"',
+        # acceptance gate UI
+        "awaiting_acceptance", "diffReview", "Accept", "/diff",
+        'doAction("accept")', 'doAction("discard")', "Reject",
     ):
         assert needle in page, f"ui.html is missing {needle!r}"
 
@@ -200,11 +204,13 @@ def main() -> int:
             break
     conn.close()
     names = [e["name"] for e in seen]
-    for expected in ("planned", "task_updated", "step", "closed"):
+    for expected in ("planned", "task_updated", "step", "run_review", "closed"):
         assert expected in names, f"missing {expected} in SSE stream: {names}"
 
-    run = wait_for(f"{base}/api/runs/{rid}", "status", {"done", "error", "failed"})
-    assert run["status"] == "done", run
+    # The run parks in awaiting_acceptance: work is staged, base untouched.
+    run = wait_for(f"{base}/api/runs/{rid}", "status",
+                   {"awaiting_acceptance", "error", "failed"})
+    assert run["status"] == "awaiting_acceptance", run
     assert [t["task_id"] for t in run["tasks"]] == [1, 2]
     t1 = run["tasks"][0]
     assert t1["title"] == "Add a subtract function (edited)", t1
@@ -212,6 +218,33 @@ def main() -> int:
     assert t1["iterations"] == 2, "expected implement->fail->fix->pass"
     t2 = run["tasks"][1]
     assert t2["status"] == "done"
+    assert "def subtract" not in (repo / "app.py").read_text(), \
+        "base branch must stay clean while the run awaits acceptance"
+
+    # -- diff endpoint --------------------------------------------------------
+    d = api_call("GET", f"{base}/api/runs/{rid}/diff")
+    assert d["run_branch"] == f"ralph/run-{rid}", d
+    assert d["base_branch"] == "main", d
+    assert d["added"] > 0 and d["deleted"] >= 0, d
+    assert any(f["path"] == "app.py" and f["added"] > 0 for f in d["files"]), d
+    assert any(f["patch"] and "def subtract" in f["patch"] for f in d["files"]), d
+    assert d["commits"], d
+    assert [t["task_id"] for t in d["tasks"]] == [1, 2], d
+
+    # -- accept: work lands in base, staging branch cleaned up ----------------
+    api_call("POST", f"{base}/api/runs/{rid}/accept")
+    run = wait_for(f"{base}/api/runs/{rid}", "status", {"accepted", "error"})
+    assert run["status"] == "accepted", run
+    assert "def subtract" in (repo / "app.py").read_text(), \
+        "staged changes should be in main after accept"
+    branches = subprocess.run(["git", "branch"], cwd=str(repo),
+                              capture_output=True, text=True).stdout
+    assert "ralph/" not in branches, f"branches should be cleaned up:\n{branches}"
+    # Accepting a second time must 409.
+    expect_error("POST", f"{base}/api/runs/{rid}/accept", 409)
+    expect_error("POST", f"{base}/api/runs/{rid}/discard", 409)
+    # diff for a cleaned-up run 404s (no staging branch)
+    expect_error("GET", f"{base}/api/runs/{rid}/diff", 404)
 
     # -- step logs ------------------------------------------------------------
     task = api_call("GET", f"{base}/api/runs/{rid}/tasks/{t1['task_id']}")
@@ -231,7 +264,8 @@ def main() -> int:
 
     # -- runs list -------------------------------------------------------------
     lst = api_call("GET", f"{base}/api/runs")["runs"]
-    assert any(r["id"] == rid and r["n_done"] == 2 and r["n_tasks"] == 2 for r in lst), lst
+    assert any(r["id"] == rid and r["n_done"] == 2 and r["n_tasks"] == 2
+               and r["status"] == "accepted" for r in lst), lst
 
     # -- plan review endpoints reject once the run is no longer awaiting -------
     expect_error("PUT", f"{base}/api/runs/{rid}/plan", 409, edited)
@@ -312,9 +346,23 @@ def main() -> int:
     stub.fail_always = False
     flaky_tests.n = 0
     api_call("POST", f"{base}/api/runs/{rid2}/retry/{run2['tasks'][0]['task_id']}")
-    run2 = wait_for(f"{base}/api/runs/{rid2}", "status", {"done", "error"})
-    assert run2["status"] == "done", run2
+    run2 = wait_for(f"{base}/api/runs/{rid2}", "status",
+                    {"awaiting_acceptance", "error"})
+    assert run2["status"] == "awaiting_acceptance", run2
     assert run2["tasks"][0]["status"] == "done"
+    # Retrying while awaiting acceptance must be refused.
+    expect_error("POST", f"{base}/api/runs/{rid2}/retry/{run2['tasks'][0]['task_id']}", 409)
+
+    # -- discard: staging work is thrown away ---------------------------------
+    api_call("POST", f"{base}/api/runs/{rid2}/discard")
+    run2 = api_call("GET", f"{base}/api/runs/{rid2}")
+    assert run2["status"] == "rejected", run2
+    branches = subprocess.run(["git", "branch"], cwd=str(repo),
+                              capture_output=True, text=True).stdout
+    assert f"ralph/run-{rid2}" not in branches, branches
+    wts = subprocess.run(["git", "worktree", "list"], cwd=str(repo),
+                         capture_output=True, text=True).stdout
+    assert wts.count("\n") <= 1, f"worktrees should be cleaned up:\n{wts}"
 
     # -- run 3: reject the plan -> cancelled, nothing executed -------------------
     r3 = api_call("POST", f"{base}/api/runs", {

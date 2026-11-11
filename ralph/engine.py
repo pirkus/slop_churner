@@ -92,6 +92,20 @@ def run(
             raise RalphError(f"task {only} is already done")
         pending = [target]
 
+    # Ensure the run's staging branch exists; tasks merge into it, and only
+    # an explicit accept (see accept_run) lands the work in the base branch.
+    if not dry_run:
+        if not cfg.run_branch:
+            cfg.run_branch = state.run_branch or gitutil.run_branch_name()
+        state.run_branch = cfg.run_branch
+        if not gitutil.branch_exists(cfg.repo, cfg.run_branch):
+            gitutil.ensure_run_branch(cfg.repo, cfg.run_branch, state.base_branch)
+            print(f"ralph: staging branch {cfg.run_branch} created from "
+                  f"{state.base_branch} (base stays clean until you accept)")
+        else:
+            print(f"ralph: continuing existing staging branch {cfg.run_branch}")
+        state.save(cfg.state_path)
+
     _print_plan(state, dry_run)
 
     for task in pending:
@@ -112,6 +126,14 @@ def run(
     done = state.done()
     failed = state.failed()
     skipped = [t for t in state.tasks if t.status not in (Status.DONE, Status.FAILED)]
+    # Leave the main checkout on the base branch; the staged work lives on
+    # its own branch until the user accepts or rejects the run.
+    if not dry_run and cfg.run_branch and gitutil.branch_exists(cfg.repo, cfg.run_branch):
+        if gitutil.current_branch(cfg.repo) == cfg.run_branch:
+            try:
+                gitutil.checkout_branch(cfg.repo, state.base_branch)
+            except gitutil.GitError:
+                pass  # dirty tree; the staged branch stays checked out
     state.save(cfg.state_path)
     report = RunReport(
         planned=len(state.tasks),
@@ -121,6 +143,20 @@ def run(
         duration=time.time() - t0,
     )
     _print_report(report)
+    if report.done and not dry_run:
+        review = gitutil.diff_overview(cfg.repo, state.base_branch, cfg.run_branch or "")
+        print(f"\nralph: {len(report.done)} task(s) staged on '{cfg.run_branch}'.")
+        print(f"      {review['stat']}")
+        for f in review["files"]:
+            print(f"        {f['path']}  (+{f['added']} -{f['deleted']})")
+        print("      review the diff, then:  ralph accept   or   ralph reject")
+        emit("run_review", {
+            "run_branch": cfg.run_branch,
+            "base_branch": state.base_branch,
+            "stat": review["stat"],
+            "files": review["files"],
+            "commits": review["commits"],
+        })
     emit("run_finished", {
         "status": "done" if report.all_done else ("cancelled" if cancelled() else "failed"),
         "done": len(done),
@@ -129,6 +165,25 @@ def run(
         "duration": report.duration,
     })
     return report
+
+
+def accept_run(cfg: Config, state: State) -> None:
+    """Merge the run's staging branch into base and clean up (the 'accept')."""
+    if not state.run_branch:
+        raise RalphError("no staged run found in state (nothing to accept)")
+    gitutil.accept_run(cfg.repo, state.run_branch, state.base_branch,
+                       f"ralph: accept run ({state.prompt[:60]})")
+    state.run_branch = None
+    state.save(cfg.state_path)
+
+
+def reject_run(cfg: Config, state: State) -> None:
+    """Discard the run's staging branch and worktrees (the 'reject')."""
+    if not state.run_branch:
+        raise RalphError("no staged run found in state (nothing to reject)")
+    gitutil.reject_run(cfg.repo, state.run_branch, state.base_branch)
+    state.run_branch = None
+    state.save(cfg.state_path)
 
 
 def _run_one(cfg: Config, state: State, task: Task, *, dry_run: bool, emit: events.Sink) -> None:
