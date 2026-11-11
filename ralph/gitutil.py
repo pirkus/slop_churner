@@ -52,7 +52,7 @@ def is_clean(cwd: Path) -> bool:
 
 def ensure_excluded(cwd: Path, pattern: str = ".ralph/") -> None:
     """Make sure ralph's scratch dir is git-ignored (via info/exclude)."""
-    gitdir = _run(cwd, "rev-parse", "--git-dir").stdout.strip()
+    gitdir = _run(cwd, "rev-parse", "--absolute-git-dir").stdout.strip()
     exclude = Path(gitdir) / "info" / "exclude"
     if not exclude.parent.is_dir():
         exclude.parent.mkdir(parents=True, exist_ok=True)
