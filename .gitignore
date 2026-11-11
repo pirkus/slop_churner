@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# ralph runtime artifacts (in case someone runs ralph on itself)
+.ralph/
+*-ralph/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

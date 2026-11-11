@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ralph</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #161b23;
+    --panel2: #1c2330;
+    --border: #2a3342;
+    --text: #d7dee8;
+    --dim: #8a97a8;
+    --accent: #5aa9ff;
+    --green: #3fb96f;
+    --red: #e5534b;
+    --amber: #e0a63f;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 12px;
+    padding: 14px 20px; border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  header h1 { font-size: 18px; margin: 0; letter-spacing: .5px; }
+  header .tag { color: var(--dim); font-size: 13px; }
+  header .db { margin-left: auto; color: var(--dim); font: 12px var(--mono); }
+  main { display: grid; grid-template-columns: 380px 1fr; gap: 0; min-height: calc(100vh - 53px); }
+  aside { border-right: 1px solid var(--border); background: var(--panel); padding: 16px; overflow-y: auto; max-height: calc(100vh - 53px); }
+  section { padding: 16px 20px; overflow-y: auto; max-height: calc(100vh - 53px); }
+
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .12em; color: var(--dim); margin: 0 0 10px; }
+  h2 + * { margin-top: 0; }
+
+  label { display: block; font-size: 12px; color: var(--dim); margin: 10px 0 4px; }
+  input[type=text], input[type=number], textarea, select {
+    width: 100%; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px; font: inherit;
+  }
+  input:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  textarea { min-height: 74px; resize: vertical; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
+  details { margin-top: 10px; }
+  details summary { cursor: pointer; color: var(--dim); font-size: 12px; user-select: none; }
+  button {
+    background: var(--accent); color: #06121f; border: 0; border-radius: 6px;
+    padding: 8px 14px; font: 600 14px inherit; cursor: pointer;
+  }
+  button:hover { filter: brightness(1.1); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.ghost { background: transparent; color: var(--dim); border: 1px solid var(--border); font-weight: 400; padding: 4px 10px; font-size: 12px; }
+  button.ghost:hover { color: var(--text); border-color: var(--dim); filter: none; }
+  button.danger { background: var(--red); color: #fff; }
+  .startrow { display: flex; gap: 8px; margin-top: 12px; }
+  .startrow button { flex: 1; }
+  .formerr { color: var(--red); font-size: 12px; margin-top: 8px; white-space: pre-wrap; min-height: 14px; }
+
+  .runlist { margin-top: 22px; display: flex; flex-direction: column; gap: 8px; }
+  .runitem {
+    border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+    cursor: pointer; background: var(--panel2);
+  }
+  .runitem:hover { border-color: var(--dim); }
+  .runitem.active { border-color: var(--accent); }
+  .runitem .top { display: flex; align-items: center; gap: 8px; }
+  .runitem .prompt { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
+  .runitem .meta { color: var(--dim); font-size: 12px; margin-top: 3px; display: flex; gap: 10px; }
+
+  .pill {
+    font-size: 11px; font-weight: 600; padding: 2px 9px; border-radius: 999px;
+    border: 1px solid; letter-spacing: .03em; white-space: nowrap;
+  }
+  .pill.pending, .pill.queued, .pill.cancelled { color: var(--dim); border-color: var(--dim); }
+  .pill.planning, .pill.pr { color: var(--accent); border-color: var(--accent); }
+  .pill.implementing, .pill.testing, .pill.fixing, .pill.running { color: var(--amber); border-color: var(--amber); }
+  .pill.done { color: var(--green); border-color: var(--green); }
+  .pill.failed, .pill.error { color: var(--red); border-color: var(--red); }
+  body.live .pill.implementing, body.live .pill.testing, body.live .pill.fixing,
+  body.live .pill.planning, body.live .pill.running { animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .45; } }
+
+  .empty { color: var(--dim); text-align: center; margin-top: 60px; }
+  .runhead { border: 1px solid var(--border); border-radius: 10px; background: var(--panel); padding: 14px 16px; margin-bottom: 16px; }
+  .runhead .top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .runhead .prompt { font-size: 16px; font-weight: 600; margin: 8px 0 4px; }
+  .runhead .meta { color: var(--dim); font-size: 12px; font-family: var(--mono); display: flex; gap: 14px; flex-wrap: wrap; }
+  .runhead .error { color: var(--red); margin-top: 8px; font-family: var(--mono); font-size: 13px; white-space: pre-wrap; }
+  .runhead button { margin-left: auto; }
+
+  .taskrow { border: 1px solid var(--border); border-radius: 10px; background: var(--panel); margin-bottom: 10px; overflow: hidden; }
+  .taskhead { display: flex; align-items: center; gap: 10px; padding: 11px 14px; cursor: pointer; }
+  .taskhead:hover { background: var(--panel2); }
+  .taskhead .tid { color: var(--dim); font-family: var(--mono); font-size: 12px; }
+  .taskhead .title { font-weight: 600; flex: 1; }
+  .taskhead .iter { color: var(--dim); font-size: 12px; font-family: var(--mono); }
+  .taskhead .chev { color: var(--dim); transition: transform .15s; }
+  .taskrow.open .chev { transform: rotate(90deg); }
+  .taskdesc { padding: 0 14px 10px 14px; color: var(--dim); font-size: 13px; white-space: pre-wrap; }
+  .taskerr { margin: 0 14px 10px; padding: 8px 10px; border: 1px solid var(--red); border-radius: 8px; color: var(--red); font-family: var(--mono); font-size: 12px; white-space: pre-wrap; max-height: 120px; overflow: auto; }
+  .steps { border-top: 1px solid var(--border); padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; background: #121722; }
+  .step { border: 1px solid var(--border); border-radius: 8px; background: var(--panel2); }
+  .steptop { display: flex; align-items: center; gap: 8px; padding: 7px 10px; }
+  .steptop .stage { font: 600 11px var(--mono); text-transform: uppercase; letter-spacing: .08em; padding: 2px 8px; border-radius: 5px; background: var(--bg); border: 1px solid var(--border); }
+  .steptop .iter { color: var(--dim); font-size: 12px; }
+  .steptop .ok { margin-left: auto; font-weight: 700; font-size: 12px; }
+  .steptop .ok.pass { color: var(--green); }
+  .steptop .ok.fail { color: var(--red); }
+  .steptop .dur { color: var(--dim); font-size: 11px; font-family: var(--mono); }
+  pre.log {
+    margin: 0; padding: 10px 12px; border-top: 1px solid var(--border);
+    font: 12px/1.5 var(--mono); white-space: pre-wrap; word-break: break-word;
+    max-height: 320px; overflow: auto; color: #b9c4d4; background: var(--bg); border-radius: 0 0 8px 8px;
+  }
+  .nodetail { color: var(--dim); font-size: 13px; padding: 8px 2px; }
+  .retryrow { display: flex; gap: 8px; padding: 0 14px 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ralph</h1>
+  <span class="tag">autonomous implement → test → PR loop</span>
+  <span class="db" id="dbpath"></span>
+</header>
+<main>
+  <aside>
+    <h2>New run</h2>
+    <form id="newrun">
+      <label for="f-repo">repo</label>
+      <input type="text" id="f-repo" value="." placeholder="/path/to/repo">
+      <label for="f-prompt">prompt</label>
+      <textarea id="f-prompt" required placeholder="What should ralph build?"></textarea>
+      <details>
+        <summary>parameters</summary>
+        <div class="grid2">
+          <div>
+            <label for="f-base">base branch</label>
+            <input type="text" id="f-base" placeholder="auto (current)">
+          </div>
+          <div>
+            <label for="f-agent">agent</label>
+            <input type="text" id="f-agent" value="pi">
+          </div>
+          <div>
+            <label for="f-model">model</label>
+            <input type="text" id="f-model" placeholder="optional">
+          </div>
+          <div>
+            <label for="f-test">test cmd</label>
+            <input type="text" id="f-test" placeholder="planner's choice">
+          </div>
+          <div>
+            <label for="f-iter">max iterations</label>
+            <input type="number" id="f-iter" value="3" min="1">
+          </div>
+          <div>
+            <label for="f-tasks">max tasks</label>
+            <input type="number" id="f-tasks" value="8" min="1">
+          </div>
+          <div>
+            <label for="f-budget">budget</label>
+            <input type="number" id="f-budget" placeholder="∞" min="1">
+          </div>
+          <div>
+            <label for="f-atimeout">agent timeout (s)</label>
+            <input type="number" id="f-atimeout" value="1800" min="1">
+          </div>
+          <div>
+            <label for="f-ttimeout">test timeout (s)</label>
+            <input type="number" id="f-ttimeout" value="900" min="1">
+          </div>
+        </div>
+      </details>
+      <div class="startrow">
+        <button type="submit" id="f-start">Start run</button>
+      </div>
+      <div class="formerr" id="f-err"></div>
+    </form>
+
+    <h2 style="margin-top:24px">Runs</h2>
+    <div class="runlist" id="runlist"></div>
+  </aside>
+
+  <section id="detail">
+    <div class="empty">select a run to watch its tasks and logs</div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let selectedRun = null;
+let es = null;                 // active EventSource
+let live = false;              // is the selected run actively running?
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  let body = null;
+  try { body = await r.json(); } catch {}
+  if (!r.ok) throw new Error((body && body.error) || r.status);
+  return body;
+}
+
+function esc(el, text) { el.textContent = text ?? ""; }
+
+function relTime(iso) {
+  if (!iso) return "";
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return Math.round(s / 60) + "m ago";
+  if (s < 86400) return Math.round(s / 3600) + "h ago";
+  return Math.round(s / 86400) + "d ago";
+}
+
+function fmtDur(x) {
+  if (x == null) return "";
+  if (x < 60) return x.toFixed(1) + "s";
+  return Math.floor(x / 60) + "m " + Math.round(x % 60) + "s";
+}
+
+const RUNNING_RUN = new Set(["queued", "planning", "running"]);
+const RUNNING_TASK = new Set(["implementing", "testing", "pr", "fixing"]);
+
+function pill(status) {
+  const s = document.createElement("span");
+  s.className = "pill " + (status || "pending");
+  s.textContent = status || "pending";
+  return s;
+}
+
+// ---- runs list ------------------------------------------------------------
+
+async function loadRuns() {
+  try {
+    const { runs } = await api("/api/runs");
+    const list = $("runlist");
+    list.innerHTML = "";
+    if (!runs.length) {
+      const e = document.createElement("div");
+      e.className = "nodetail";
+      e.textContent = "no runs yet — start one on the left";
+      list.appendChild(e);
+    }
+    for (const r of runs) {
+      const item = document.createElement("div");
+      item.className = "runitem" + (r.id === selectedRun ? " active" : "");
+      const top = document.createElement("div");
+      top.className = "top";
+      top.appendChild(pill(r.status));
+      const p = document.createElement("span");
+      p.className = "prompt";
+      esc(p, r.prompt);
+      top.appendChild(p);
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      const m1 = document.createElement("span"); esc(m1, r.repo);
+      const m2 = document.createElement("span"); esc(m2, r.n_done + "/" + r.n_tasks + " tasks");
+      const m3 = document.createElement("span"); esc(m3, relTime(r.created_at));
+      const m4 = document.createElement("span"); esc(m4, "#" + r.id);
+      meta.append(m1, m2, m3, m4);
+      item.append(top, meta);
+      item.onclick = () => selectRun(r.id);
+      list.appendChild(item);
+    }
+  } catch (e) { /* server briefly unavailable; retry next poll */ }
+}
+
+// ---- run detail -----------------------------------------------------------
+
+async function selectRun(id) {
+  selectedRun = id;
+  setLive(false);
+  const data = await api("/api/runs/" + id);
+  renderRun(data);
+  loadRuns();
+}
+
+function setLive(on) {
+  live = on;
+  document.body.classList.toggle("live", on);
+}
+
+function renderRun(data) {
+  const d = $("detail");
+  d.innerHTML = "";
+
+  // header
+  const head = document.createElement("div");
+  head.className = "runhead";
+  const top = document.createElement("div");
+  top.className = "top";
+  top.appendChild(pill(data.status));
+  const idl = document.createElement("span");
+  idl.className = "meta"; esc(idl, "run #" + data.id);
+  top.appendChild(idl);
+  if (data.running) {
+    const b = document.createElement("button");
+    b.className = "danger"; b.textContent = "Cancel";
+    b.onclick = async () => {
+      b.disabled = true;
+      try { await api(`/api/runs/${data.id}/cancel`, { method: "POST" }); }
+      catch (e) { b.disabled = false; alert(e.message); }
+    };
+    top.appendChild(b);
+  }
+  const p = document.createElement("div");
+  p.className = "prompt"; esc(p, data.prompt);
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  const P = data.params || {};
+  for (const [k, v] of [
+    ["repo", data.repo], ["base", P.base || data.base_branch],
+    ["agent", P.agent || "pi"], ["model", P.model],
+    ["test", data.test_cmd || "(planner)"],
+    ["max iter", P.max_iterations], ["created", data.created_at],
+    ["finished", data.finished_at],
+  ]) {
+    if (v == null || v === "") continue;
+    const s = document.createElement("span");
+    s.textContent = `${k}: ${v}`;
+    meta.appendChild(s);
+  }
+  head.append(top, p, meta);
+  if (data.error) {
+    const e = document.createElement("div");
+    e.className = "error"; esc(e, data.error);
+    head.appendChild(e);
+  }
+  d.appendChild(head);
+
+  // tasks
+  if (!data.tasks || !data.tasks.length) {
+    const e = document.createElement("div");
+    e.className = "nodetail";
+    e.textContent = data.status === "queued" || data.status === "planning"
+      ? "planning tasks… (logs appear once the planner returns)"
+      : "no tasks recorded";
+    d.appendChild(e);
+  }
+  for (const t of data.tasks) d.appendChild(taskRow(t));
+}
+
+function taskRow(t) {
+  const row = document.createElement("div");
+  row.className = "taskrow";
+  row.dataset.tid = t.task_id;
+
+  const head = document.createElement("div");
+  head.className = "taskhead";
+  const chev = document.createElement("span");
+  chev.className = "chev"; chev.textContent = "▸";
+  head.appendChild(chev);
+  head.appendChild(pill(t.status));
+  const tid = document.createElement("span");
+  tid.className = "tid"; esc(tid, "#" + t.task_id);
+  const title = document.createElement("span");
+  title.className = "title"; esc(title, t.title);
+  const iter = document.createElement("span");
+  iter.className = "iter"; esc(iter, t.iterations ? `iter ${t.iterations}` : "");
+  head.append(tid, title, iter);
+  row.appendChild(head);
+
+  if (t.description) {
+    const desc = document.createElement("div");
+    desc.className = "taskdesc"; esc(desc, t.description);
+    row.appendChild(desc);
+  }
+  if (t.status === "failed" && t.last_error) {
+    const err = document.createElement("div");
+    err.className = "taskerr"; esc(err, t.last_error);
+    row.appendChild(err);
+    const rr = document.createElement("div");
+    rr.className = "retryrow";
+    const b = document.createElement("button");
+    b.className = "ghost"; b.textContent = "Retry task";
+    b.onclick = async (ev) => {
+      ev.stopPropagation();
+      b.disabled = true;
+      try {
+        await api(`/api/runs/${selectedRun}/retry/${t.task_id}`, { method: "POST" });
+        selectRun(selectedRun);
+      } catch (e) { b.disabled = false; alert(e.message); }
+    };
+    rr.appendChild(b);
+    row.appendChild(rr);
+  }
+
+  const steps = document.createElement("div");
+  steps.className = "steps";
+  steps.style.display = "none";
+  row.appendChild(steps);
+
+  let loaded = false;
+  head.onclick = async () => {
+    row.classList.toggle("open");
+    const open = row.classList.contains("open");
+    steps.style.display = open ? "" : "none";
+    if (open && !loaded) {
+      loaded = true;
+      steps.innerHTML = "";
+      try {
+        const { steps: st } = await api(`/api/runs/${selectedRun}/tasks/${t.task_id}`);
+        if (!st.length) {
+          const e = document.createElement("div");
+          e.className = "nodetail";
+          e.textContent = "no steps yet";
+          steps.appendChild(e);
+        } else {
+          for (const s of st) steps.appendChild(stepCard(s));
+        }
+      } catch (e) { alert(e.message); }
+    }
+  };
+  return row;
+}
+
+function stepCard(s) {
+  const step = document.createElement("div");
+  step.className = "step";
+  const top = document.createElement("div");
+  top.className = "steptop";
+  const st = document.createElement("span");
+  st.className = "stage"; esc(st, s.stage);
+  const it = document.createElement("span");
+  it.className = "iter"; esc(it, "iter " + s.iteration);
+  top.append(st, it);
+  if (s.ok != null) {
+    const ok = document.createElement("span");
+    ok.className = "ok " + (s.ok ? "pass" : "fail");
+    ok.textContent = s.ok ? "✓ pass" : "✗ fail";
+    top.appendChild(ok);
+  }
+  if (s.duration != null) {
+    const du = document.createElement("span");
+    du.className = "dur"; esc(du, fmtDur(s.duration));
+    top.appendChild(du);
+  }
+  step.appendChild(top);
+  if (s.output) {
+    const pre = document.createElement("pre");
+    pre.className = "log";
+    esc(pre, s.output);
+    step.appendChild(pre);
+  }
+  return step;
+}
+
+// ---- live updates ---------------------------------------------------------
+
+function openSSE(id) {
+  if (es) es.close();
+  es = new EventSource(`/api/runs/${id}/events`);
+  es.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    const { name, data } = msg;
+    if (name === "task_updated") {
+      const row = document.querySelector(`.taskrow[data-tid="${data.id}"]`);
+      if (row && selectedRun === id) {
+        row.replaceWith(taskRow(data));
+      }
+    } else if (name === "step") {
+      const row = document.querySelector(`.taskrow.open[data-tid="${data.task_id}"]`);
+      const box = row && row.querySelector(".steps");
+      if (box) {
+        const nod = box.querySelector(".nodetail");
+        if (nod) nod.remove();
+        box.appendChild(stepCard(data));
+        box.scrollTop = box.scrollHeight;
+      }
+    } else if (name === "closed" || name === "error" || name === "run_finished") {
+      setLive(false);
+      if (name === "closed" && es) es.close();
+      selectRun(id).catch(() => {});
+    }
+  };
+  es.onerror = () => { /* EventSource retries automatically */ };
+}
+
+// ---- new run form ---------------------------------------------------------
+
+$("newrun").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const errEl = $("f-err");
+  errEl.textContent = "";
+  const val = (id, num) => {
+    const v = $(id).value.trim();
+    if (v === "") return null;
+    return num ? Number(v) : v;
+  };
+  const body = {
+    prompt: $("f-prompt").value,
+    repo: val("f-repo") || ".",
+    base: val("f-base"),
+    agent: val("f-agent") || "pi",
+    model: val("f-model"),
+    test_cmd: val("f-test"),
+    max_iterations: val("f-iter", true),
+    max_tasks: val("f-tasks", true),
+    budget: val("f-budget", true),
+    agent_timeout: val("f-atimeout", true),
+    test_timeout: val("f-ttimeout", true),
+  };
+  if (!body.prompt.trim()) { errEl.textContent = "prompt is required"; return; }
+  const btn = $("f-start");
+  btn.disabled = true;
+  try {
+    const { run_id } = await api("/api/runs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    $("f-prompt").value = "";
+    await selectRun(run_id);
+  } catch (err) {
+    errEl.textContent = err.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// ---- boot ------------------------------------------------------------------
+
+(async function boot() {
+  try {
+    const h = await api("/api/health");
+    $("dbpath").textContent = h.db;
+  } catch {}
+  await loadRuns();
+  setInterval(loadRuns, 4000);
+})();
+</script>
+</body>
+</html>
