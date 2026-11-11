@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
+from typing import Callable
 from pathlib import Path
 
 from .config import Config
@@ -66,37 +67,26 @@ def run_agent(
     timeout: int | None = None,
     label: str = "agent",
     quiet: bool = False,
+    on_output: Callable[[str], None] | None = None,
 ) -> AgentResult:
-    """Run a single fresh-context pi invocation and return its result."""
+    """Run a single fresh-context pi invocation and return its result.
+
+    Stdout is streamed line-by-line: each line is passed to ``on_output``
+    as it arrives (if a callback was given), instead of only being
+    visible once the call returns.
+    """
     cmd = _build_cmd(cfg, prompt, tools)
     cwd.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
+    effective_timeout = timeout if timeout is not None else cfg.agent_timeout
     try:
-        with heartbeat(label, enabled=not quiet):
-            proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             cwd=str(cwd),
             env=_env(),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout if timeout is not None else cfg.agent_timeout,
-        )
-        out = proc.stdout or ""
-        if proc.stderr:
-            out += "\n[stderr]\n" + proc.stderr
-        return AgentResult(
-            ok=proc.returncode == 0,
-            output=out.strip(),
-            returncode=proc.returncode,
-            duration=time.time() - t0,
-        )
-    except subprocess.TimeoutExpired as exc:
-        partial = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
-        return AgentResult(
-            ok=False,
-            output=f"agent timed out after {timeout or cfg.agent_timeout}s\n{partial}".strip(),
-            returncode=-1,
-            duration=time.time() - t0,
         )
     except FileNotFoundError:
         return AgentResult(
@@ -105,3 +95,56 @@ def run_agent(
             returncode=127,
             duration=time.time() - t0,
         )
+
+    timed_out = threading.Event()
+
+    def _watchdog() -> None:
+        if effective_timeout is None or timed_out.wait(effective_timeout):
+            return
+        timed_out.set()
+        proc.kill()
+
+    stderr_chunks: list[str] = []
+
+    def _drain_stderr() -> None:
+        for line in proc.stderr:
+            stderr_chunks.append(line)
+
+    wd = threading.Thread(target=_watchdog, daemon=True)
+    wd.start()
+    err = threading.Thread(target=_drain_stderr, daemon=True)
+    err.start()
+    stdout_lines: list[str] = []
+    try:
+        with heartbeat(label, enabled=not quiet):
+            for line in proc.stdout:
+                stdout_lines.append(line)
+                if on_output is not None:
+                    on_output(line)
+            err.join()
+            proc.wait()
+    finally:
+        err.join()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        wd.join(timeout=0)
+
+    if timed_out.is_set():
+        partial = "".join(stdout_lines)
+        return AgentResult(
+            ok=False,
+            output=f"agent timed out after {effective_timeout}s\n{partial}".strip(),
+            returncode=-1,
+            duration=time.time() - t0,
+        )
+
+    out = "".join(stdout_lines)
+    if stderr_chunks:
+        out += "\n[stderr]\n" + "".join(stderr_chunks)
+    return AgentResult(
+        ok=proc.returncode == 0,
+        output=out.strip(),
+        returncode=proc.returncode,
+        duration=time.time() - t0,
+    )

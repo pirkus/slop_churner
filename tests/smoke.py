@@ -7,6 +7,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -261,5 +262,67 @@ def main_plan_supplied() -> int:
     return 0
 
 
+def main_streaming() -> int:
+    """run_agent streams stdout lines to on_output as they arrive."""
+    from ralph import agent
+
+    tmp = Path(tempfile.mkdtemp(prefix="ralph-stream-"))
+    # agent_cmd must accept the "-p <prompt>" args ralph passes it.
+    script = tmp / "fake_agent"
+    script.write_text("#!/bin/sh\necho a\nsleep 0.3\necho b\n")
+    script.chmod(0o755)
+    err_script = tmp / "fake_err"
+    err_script.write_text("#!/bin/sh\necho out\n1>&2 echo err-line\nexit 3\n")
+    err_script.chmod(0o755)
+    slow_script = tmp / "fake_slow"
+    slow_script.write_text("#!/bin/sh\necho early\nsleep 5\n")
+    slow_script.chmod(0o755)
+
+    repo = tmp / "proj"
+    repo.mkdir()
+    make_repo(repo)
+    cfg = Config(repo=repo, base_branch="main", agent_cmd=str(script))
+
+
+    # 1) on_output receives every line, in order, BEFORE the process exits.
+    seen: list[tuple[str, float]] = []
+    t0 = time.time()
+    r = agent.run_agent(cfg, "hello", cwd=tmp, label="stream test", quiet=True,
+                        on_output=lambda line: seen.append((line, time.time())))
+    t1 = time.time()
+    assert r.ok and r.returncode == 0, r
+    assert r.output == "a\nb", r.output
+    assert [ln for ln, _ in seen] == ["a\n", "b\n"], seen
+    # 'a' arrives while the child is still in its sleep (i.e. it is truly
+    # streamed, not buffered until exit), and both lines precede the return.
+    assert seen[0][1] - t0 < 0.25, "first line must arrive before the 0.3s sleep ends"
+    assert all(t < t1 for _, t in seen)
+
+    # 2) on_output=None keeps the old contract (stdout + [stderr] suffix).
+    cfg2 = Config(repo=tmp / "proj", base_branch="main", agent_cmd=str(err_script))
+    r2 = agent.run_agent(cfg2, "hello", cwd=tmp, label="err test", quiet=True)
+    assert not r2.ok and r2.returncode == 3, r2
+    assert r2.output == "out\n\n[stderr]\nerr-line", r2.output
+
+    # 3) timeout kills the process and returns returncode -1.
+    cfg3 = Config(repo=tmp / "proj", base_branch="main", agent_cmd=str(slow_script))
+    streamed: list[str] = []
+    r3 = agent.run_agent(cfg3, "hello", cwd=tmp, label="slow", quiet=True,
+                         timeout=1, on_output=streamed.append)
+    assert not r3.ok and r3.returncode == -1, r3
+    assert "agent timed out after 1s" in r3.output, r3.output
+    assert r3.output.endswith("early"), r3.output
+    assert streamed == ["early\n"], streamed
+
+    # 4) missing binary still maps to 127.
+    cfg4 = Config(repo=tmp / "proj", base_branch="main", agent_cmd="definitely-not-a-real-agent")
+    r4 = agent.run_agent(cfg4, "hello", cwd=tmp, label="missing", quiet=True)
+    assert not r4.ok and r4.returncode == 127, r4
+    assert "agent command not found" in r4.output, r4.output
+
+    print("\nSMOKE TEST (streaming) PASSED")
+    return 0
+
+
 if __name__ == "__main__":
-    raise SystemExit(main() or main_plan_supplied())
+    raise SystemExit(main() or main_plan_supplied() or main_streaming())
