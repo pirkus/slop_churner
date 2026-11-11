@@ -55,16 +55,22 @@ def run(
     only: int | None = None,
     sink: events.Sink | None = None,
     is_cancelled: Callable[[], bool] | None = None,
+    plan: planner.Plan | None = None,
 ) -> RunReport:
     emit = sink or events.noop
     cancelled = is_cancelled or (lambda: False)
     t0 = time.time()
     gitutil.ensure_excluded(cfg.repo)
-    needs_plan = force_plan or State.load(cfg.state_path) is None
-    if needs_plan:
-        print(f"ralph: planning tasks with '{cfg.agent_cmd}'… "
-              f"(first line below appears when it returns)", flush=True)
-    state = _load_or_plan(cfg, request, force_plan=force_plan)
+    if plan is not None:
+        # Pre-supplied plan: build the state directly, no planner agent.
+        state = planner.build_state(cfg, request, plan)
+        state.save(cfg.state_path)
+    else:
+        needs_plan = force_plan or State.load(cfg.state_path) is None
+        if needs_plan:
+            print(f"ralph: planning tasks with '{cfg.agent_cmd}'… "
+                  f"(first line below appears when it returns)", flush=True)
+        state = _load_or_plan(cfg, request, force_plan=force_plan)
 
     emit("run_started", {
         "repo": str(cfg.repo),
