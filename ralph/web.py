@@ -113,7 +113,10 @@ def _planning_worker(ctx: "ServerContext", run_id: int, params: dict[str, Any]) 
     try:
         ctx.store.set_run_status(run_id, "planning")
         cfg = _build_cfg(params)
-        plan = planner.plan(cfg, params.get("prompt", ""))
+        # Stream the planner's live output to the UI over SSE (agent_output
+        # is live-only; the store ignores it).
+        sink = WebSink(ctx.store, ctx.hub, run_id)
+        plan = planner.plan(cfg, params.get("prompt", ""), sink=sink)
         for t in plan.tasks:
             ctx.store.upsert_task(run_id, t.to_dict())
         ctx.store.set_plan_test_cmd(run_id, plan.test_cmd)

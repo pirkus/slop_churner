@@ -141,7 +141,9 @@ def run_task(
 
         print(f"    [{attempt}/{cfg.max_iterations}] {stage}…", flush=True)
         agent = run_agent(cfg, prompt, cwd=wt,
-                          label=f"task {task.id}: {stage}")
+                          label=f"task {task.id}: {stage}",
+                          on_output=lambda line: emit("agent_output", {
+                              "task_id": task.id, "stage": step_stage, "line": line}))
         _log(cfg, task, step_stage,
              f"$ agent rc={agent.returncode}\n{agent.output}")
         emit("step", {

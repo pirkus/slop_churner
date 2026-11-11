@@ -45,6 +45,12 @@ class StubAgent:
 
     def __call__(self, cfg, prompt, *, cwd, tools=None, timeout=None, **kw):
         time.sleep(0.2)  # give the SSE client a window to observe a live event
+        # Simulate streaming agent output: emit a few lines while the
+        # "agent" is still running (i.e. before this call returns).
+        on_output = kw.get("on_output")
+        if on_output is not None:
+            for i in range(1, 4):
+                on_output(f"stub agent line {i}\n")
         if "planning stage" in prompt:
             return AgentResult(True, smoke.PLAN_JSON, 0, 0.2)
         app = cwd / "app.py"
@@ -132,6 +138,8 @@ def main() -> int:
         # acceptance gate UI
         "awaiting_acceptance", "diffReview", "Accept", "/diff",
         'doAction("accept")', 'doAction("discard")', "Reject",
+        # live agent output pane + SSE handler
+        "liveout", "live agent output", 'name === "agent_output"',
     ):
         assert needle in page, f"ui.html is missing {needle!r}"
 
@@ -204,8 +212,22 @@ def main() -> int:
             break
     conn.close()
     names = [e["name"] for e in seen]
-    for expected in ("planned", "task_updated", "step", "run_review", "closed"):
+    for expected in ("planned", "agent_output", "task_updated", "step",
+                     "run_review", "closed"):
         assert expected in names, f"missing {expected} in SSE stream: {names}"
+    # agent_output lines must be delivered WHILE the agent is still running:
+    # the first implement agent_output precedes the implement 'step' event
+    # (the step only fires once the agent call has returned).
+    ao_idx = [i for i, e in enumerate(seen)
+              if e["name"] == "agent_output" and e["data"].get("stage") == "implement"]
+    assert ao_idx, f"no implement agent_output in SSE stream: {names}"
+    step_idx = [i for i, e in enumerate(seen)
+                if e["name"] == "step" and e["data"].get("stage") == "implement"]
+    assert step_idx, f"no implement step in SSE stream: {names}"
+    assert ao_idx[0] < step_idx[0], \
+        f"agent_output ({ao_idx[0]}) must arrive before step ({step_idx[0]}): {names}"
+    ao = seen[ao_idx[0]]["data"]
+    assert ao["task_id"] == 1 and ao["line"].startswith("stub agent line"), ao
 
     # The run parks in awaiting_acceptance: work is staged, base untouched.
     run = wait_for(f"{base}/api/runs/{rid}", "status",
