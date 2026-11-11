@@ -31,6 +31,10 @@ CREATE TABLE IF NOT EXISTS runs (
     repo        TEXT NOT NULL,
     prompt      TEXT NOT NULL,
     params      TEXT NOT NULL DEFAULT '{}',
+    -- Approved plan for this run: the test_cmd the planner settled on
+    -- (see apply_event "planned"). Stored as its own column so plans can
+    -- be edited/replaced per run without touching the immutable `params`.
+    plan_test_cmd TEXT,
     status      TEXT NOT NULL DEFAULT 'queued',
     error       TEXT,
     created_at  TEXT NOT NULL,
@@ -81,6 +85,12 @@ class Store:
         self._conn.execute("PRAGMA foreign_keys=ON")
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            # Migration for databases created before plan_test_cmd existed:
+            # CREATE TABLE IF NOT EXISTS leaves old runs tables untouched, so
+            # add the column if it is missing.
+            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(runs)")}
+            if "plan_test_cmd" not in cols:
+                self._conn.execute("ALTER TABLE runs ADD COLUMN plan_test_cmd TEXT")
             self._conn.commit()
 
     def close(self) -> None:
@@ -115,6 +125,34 @@ class Store:
                 (status, error, _now(), _now(), run_id),
             )
             self._conn.commit()
+
+    def set_plan_test_cmd(self, run_id: int, test_cmd: str | None) -> None:
+        """Store (or clear) the approved plan's test_cmd for a run."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE runs SET plan_test_cmd = ?, updated_at = ? WHERE id = ?",
+                (test_cmd, _now(), run_id),
+            )
+            self._conn.commit()
+
+    def get_plan(self, run_id: int) -> dict[str, Any] | None:
+        """Return the stored plan for a run: ``{test_cmd, tasks}``.
+
+        ``tasks`` is the current ordered task list; ``test_cmd`` is the
+        approved plan command (None if no plan has been recorded yet).
+        Returns None if the run does not exist.
+        """
+        with self._lock:
+            self._conn.row_factory = sqlite3.Row
+            row = self._conn.execute(
+                "SELECT plan_test_cmd FROM runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            tasks = [dict(r) for r in self._conn.execute(
+                "SELECT * FROM tasks WHERE run_id = ? ORDER BY task_id", (run_id,)
+            ).fetchall()]
+            return {"test_cmd": row["plan_test_cmd"], "tasks": tasks}
 
     def list_runs(self) -> list[sqlite3.Row]:
         with self._lock:
@@ -177,6 +215,24 @@ class Store:
             self._upsert_task(run_id, t)
             self._conn.commit()
 
+    def replace_tasks(self, run_id: int, tasks: list[dict[str, Any]]) -> None:
+        """Replace the run's whole task list with a fresh ordered one.
+
+        Deletes every existing task row for the run, then inserts the given
+        tasks in order (each dict needs ``task_id``, ``title``,
+        ``description``; ``task_id`` is the ordering key). Reuses
+        ``_upsert_task`` so new rows keep the standard defaults.
+        """
+        with self._lock:
+            self._conn.execute("DELETE FROM tasks WHERE run_id = ?", (run_id,))
+            for t in tasks:
+                self._upsert_task(run_id, {
+                    "id": int(t["task_id" if "task_id" in t else t["id"]]),
+                    "title": t.get("title", ""),
+                    "description": t.get("description", ""),
+                })
+            self._conn.commit()
+
     def get_tasks(self, run_id: int) -> list[dict[str, Any]]:
         with self._lock:
             self._conn.row_factory = sqlite3.Row
@@ -225,6 +281,12 @@ class Store:
         """Fold one engine event into the database."""
         with self._lock:
             if name == "planned":
+                # Persist the approved plan: its test_cmd plus the task list.
+                if data.get("test_cmd") is not None:
+                    self._conn.execute(
+                        "UPDATE runs SET plan_test_cmd = ? WHERE id = ?",
+                        (data["test_cmd"], run_id),
+                    )
                 for t in data.get("tasks", []):
                     self._upsert_task(run_id, t)
             elif name == "task_updated":
