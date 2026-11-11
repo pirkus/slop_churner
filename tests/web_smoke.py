@@ -25,7 +25,10 @@ import tests.smoke as smoke  # reuse repo fixture + plan JSON  # noqa: E402
 from ralph import planner, runner  # noqa: E402
 from ralph.agent import AgentResult  # noqa: E402
 from ralph.config import Config  # noqa: E402
-from ralph.web import Handler, ServerContext  # noqa: E402
+from ralph.web import Handler, ServerContext, _H2  # noqa: E402
+
+if _H2:  # boot the dual h2c/HTTP1.1 server when h2 is available
+    from ralph.web import _DualRequestHandler, _ThreadingTCPServer  # noqa: E402
 
 
 def sh(cwd, *a):
@@ -111,11 +114,16 @@ def main() -> int:
     runner.run_agent = stub
     runner.run_tests = flaky_tests
 
-    # Boot the server in-process on a random port.
+    # Boot the server in-process on a random port. With h2 installed this is
+    # the dual-protocol (h2c + HTTP/1.1) server, so every HTTP/1.1 assertion
+    # below also exercises the preface sniffing + fallback path.
     db = tmp / "ralph.db"
     ctx = ServerContext(db)
     Handler.ctx = ctx
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    if _H2:
+        httpd = _ThreadingTCPServer(("127.0.0.1", 0), _DualRequestHandler)
+    else:
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     port = httpd.server_address[1]
     base = f"http://127.0.0.1:{port}"
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -421,6 +429,15 @@ def main() -> int:
         raise AssertionError("expected 409")
     except urllib.error.HTTPError as e:
         assert e.code == 409
+
+    # -- cleartext HTTP/2 (h2c) on the same port ---------------------------------
+    # NOTE: must run before the run-count assertions below (SSE check creates
+    # a run row).
+    if _H2:
+        import tests.http2_smoke as h2smoke
+        h2smoke.h2_checks(ctx, port, db)
+    else:
+        print("\nh2 not installed; skipping HTTP/2 checks")
 
     # -- DB file actually on disk -------------------------------------------------
     assert db.exists()
