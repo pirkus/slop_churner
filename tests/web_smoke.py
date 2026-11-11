@@ -22,13 +22,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import tests.smoke as smoke  # reuse repo fixture + plan JSON  # noqa: E402
-from ralph import planner, runner  # noqa: E402
-from ralph.agent import AgentResult  # noqa: E402
-from ralph.config import Config  # noqa: E402
-from ralph.web import Handler, ServerContext, _H2  # noqa: E402
+from slop_churner import planner, runner  # noqa: E402
+from slop_churner.agent import AgentResult  # noqa: E402
+from slop_churner.config import Config  # noqa: E402
+from slop_churner.web import Handler, ServerContext, _H2  # noqa: E402
 
 if _H2:  # boot the dual h2c/HTTP1.1 server when h2 is available
-    from ralph.web import _DualRequestHandler, _ThreadingTCPServer  # noqa: E402
+    from slop_churner.web import _DualRequestHandler, _ThreadingTCPServer  # noqa: E402
 
 
 def sh(cwd, *a):
@@ -102,7 +102,7 @@ def expect_error(method: str, url: str, code: int, body: dict | None = None) -> 
 
 
 def main() -> int:
-    tmp = Path(tempfile.mkdtemp(prefix="ralph-web-smoke-"))
+    tmp = Path(tempfile.mkdtemp(prefix="slop-churner-web-smoke-"))
     repo = tmp / "proj"
     repo.mkdir()
     make_repo(repo)
@@ -117,7 +117,7 @@ def main() -> int:
     # Boot the server in-process on a random port. With h2 installed this is
     # the dual-protocol (h2c + HTTP/1.1) server, so every HTTP/1.1 assertion
     # below also exercises the preface sniffing + fallback path.
-    db = tmp / "ralph.db"
+    db = tmp / "slop-churner.db"
     ctx = ServerContext(db)
     Handler.ctx = ctx
     if _H2:
@@ -253,7 +253,7 @@ def main() -> int:
 
     # -- diff endpoint --------------------------------------------------------
     d = api_call("GET", f"{base}/api/runs/{rid}/diff")
-    assert d["run_branch"] == f"ralph/run-{rid}", d
+    assert d["run_branch"] == f"slop-churner/run-{rid}", d
     assert d["base_branch"] == "main", d
     assert d["added"] > 0 and d["deleted"] >= 0, d
     assert any(f["path"] == "app.py" and f["added"] > 0 for f in d["files"]), d
@@ -269,7 +269,7 @@ def main() -> int:
         "staged changes should be in main after accept"
     branches = subprocess.run(["git", "branch"], cwd=str(repo),
                               capture_output=True, text=True).stdout
-    assert "ralph/" not in branches, f"branches should be cleaned up:\n{branches}"
+    assert "slop-churner/" not in branches, f"branches should be cleaned up:\n{branches}"
     # Accepting a second time must 409.
     expect_error("POST", f"{base}/api/runs/{rid}/accept", 409)
     expect_error("POST", f"{base}/api/runs/{rid}/discard", 409)
@@ -304,7 +304,7 @@ def main() -> int:
 
     # -- store plan API: get_plan / replace_tasks -------------------------------
     # Migration: an old-schema DB (no plan_test_cmd) must gain the column.
-    from ralph.store import Store
+    from slop_churner.store import Store
     old_db = tmp / "old-schema.db"
     import sqlite3 as _s3
     _c = _s3.connect(str(old_db))
@@ -389,7 +389,7 @@ def main() -> int:
     assert run2["status"] == "rejected", run2
     branches = subprocess.run(["git", "branch"], cwd=str(repo),
                               capture_output=True, text=True).stdout
-    assert f"ralph/run-{rid2}" not in branches, branches
+    assert f"slop-churner/run-{rid2}" not in branches, branches
     wts = subprocess.run(["git", "worktree", "list"], cwd=str(repo),
                          capture_output=True, text=True).stdout
     assert wts.count("\n") <= 1, f"worktrees should be cleaned up:\n{wts}"

@@ -27,12 +27,12 @@ def slugify(text: str) -> str:
 
 
 def branch_name(task_id: int, title: str) -> str:
-    return f"ralph/{task_id}-{slugify(title)}"
+    return f"slop-churner/{task_id}-{slugify(title)}"
 
 
 def run_branch_name(run_id: int | None = None) -> str:
-    """Staging branch for one ralph run; tasks merge here, not into base."""
-    return f"ralph/run-{run_id}" if run_id is not None else "ralph/run"
+    """Staging branch for one slop-churner run; tasks merge here, not into base."""
+    return f"slop-churner/run-{run_id}" if run_id is not None else "slop-churner/run"
 
 
 def branch_exists(repo: Path, branch: str) -> bool:
@@ -55,12 +55,12 @@ def remote_name(cwd: Path) -> str | None:
 
 
 def is_clean(cwd: Path) -> bool:
-    # Ignore ralph's own scratch dir so writing state never counts as dirty.
-    return not _run(cwd, "status", "--porcelain", "--", ".", ":!.ralph").stdout.strip()
+    # Ignore slop-churner's own scratch dir so writing state never counts as dirty.
+    return not _run(cwd, "status", "--porcelain", "--", ".", ":!.slop-churner").stdout.strip()
 
 
-def ensure_excluded(cwd: Path, pattern: str = ".ralph/") -> None:
-    """Make sure ralph's scratch dir is git-ignored (via info/exclude)."""
+def ensure_excluded(cwd: Path, pattern: str = ".slop-churner/") -> None:
+    """Make sure slop-churner's scratch dir is git-ignored (via info/exclude)."""
     gitdir = _run(cwd, "rev-parse", "--absolute-git-dir").stdout.strip()
     exclude = Path(gitdir) / "info" / "exclude"
     if not exclude.parent.is_dir():
@@ -69,7 +69,7 @@ def ensure_excluded(cwd: Path, pattern: str = ".ralph/") -> None:
     if any(line.strip() == pattern for line in existing.splitlines()):
         return
     exclude.write_text(existing.rstrip("\n") + f"\n{pattern}\n"
-                       if existing.strip() else f"# ralph scratch dir\n{pattern}\n")
+                       if existing.strip() else f"# slop-churner scratch dir\n{pattern}\n")
 
 
 def _branch_exists(repo: Path, branch: str) -> bool:

@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 from . import events, gitutil, planner, runner
 from .config import Config
-from .errors import RalphError
+from .errors import SlopChurnerError
 from .state import State, Status, Task
 
 
@@ -69,7 +69,7 @@ def run(
     else:
         needs_plan = force_plan or State.load(cfg.state_path) is None
         if needs_plan:
-            print(f"ralph: planning tasks with '{cfg.agent_cmd}'… "
+            print(f"slop-churner: planning tasks with '{cfg.agent_cmd}'… "
                   f"(first line below appears when it returns)", flush=True)
         state = _load_or_plan(cfg, request, force_plan=force_plan, sink=emit)
 
@@ -88,9 +88,9 @@ def run(
     if only is not None:
         target = state.by_id(only)
         if target is None:
-            raise RalphError(f"no task with id {only}")
+            raise SlopChurnerError(f"no task with id {only}")
         if target.status in (Status.DONE,):
-            raise RalphError(f"task {only} is already done")
+            raise SlopChurnerError(f"task {only} is already done")
         pending = [target]
 
     # Ensure the run's staging branch exists; tasks merge into it, and only
@@ -101,10 +101,10 @@ def run(
         state.run_branch = cfg.run_branch
         if not gitutil.branch_exists(cfg.repo, cfg.run_branch):
             gitutil.ensure_run_branch(cfg.repo, cfg.run_branch, state.base_branch)
-            print(f"ralph: staging branch {cfg.run_branch} created from "
+            print(f"slop-churner: staging branch {cfg.run_branch} created from "
                   f"{state.base_branch} (base stays clean until you accept)")
         else:
-            print(f"ralph: continuing existing staging branch {cfg.run_branch}")
+            print(f"slop-churner: continuing existing staging branch {cfg.run_branch}")
         state.save(cfg.state_path)
 
     _print_plan(state, dry_run)
@@ -146,11 +146,11 @@ def run(
     _print_report(report)
     if report.done and not dry_run:
         review = gitutil.diff_overview(cfg.repo, state.base_branch, cfg.run_branch or "")
-        print(f"\nralph: {len(report.done)} task(s) staged on '{cfg.run_branch}'.")
+        print(f"\nslop-churner: {len(report.done)} task(s) staged on '{cfg.run_branch}'.")
         print(f"      {review['stat']}")
         for f in review["files"]:
             print(f"        {f['path']}  (+{f['added']} -{f['deleted']})")
-        print("      review the diff, then:  ralph accept   or   ralph reject")
+        print("      review the diff, then:  slop-churner accept   or   slop-churner reject")
         emit("run_review", {
             "run_branch": cfg.run_branch,
             "base_branch": state.base_branch,
@@ -171,9 +171,9 @@ def run(
 def accept_run(cfg: Config, state: State) -> None:
     """Merge the run's staging branch into base and clean up (the 'accept')."""
     if not state.run_branch:
-        raise RalphError("no staged run found in state (nothing to accept)")
+        raise SlopChurnerError("no staged run found in state (nothing to accept)")
     gitutil.accept_run(cfg.repo, state.run_branch, state.base_branch,
-                       f"ralph: accept run ({state.prompt[:60]})")
+                       f"slop-churner: accept run ({state.prompt[:60]})")
     state.run_branch = None
     state.save(cfg.state_path)
 
@@ -181,7 +181,7 @@ def accept_run(cfg: Config, state: State) -> None:
 def reject_run(cfg: Config, state: State) -> None:
     """Discard the run's staging branch and worktrees (the 'reject')."""
     if not state.run_branch:
-        raise RalphError("no staged run found in state (nothing to reject)")
+        raise SlopChurnerError("no staged run found in state (nothing to reject)")
     gitutil.reject_run(cfg.repo, state.run_branch, state.base_branch)
     state.run_branch = None
     state.save(cfg.state_path)
@@ -191,12 +191,12 @@ def _run_one(cfg: Config, state: State, task: Task, *, dry_run: bool, emit: even
     print(f"\n  task {task.id}: {task.title}")
     runner.run_task(cfg, state, task, dry_run=dry_run, sink=emit)
     icon = {"done": "✓", "failed": "✗"}.get(task.status.value, "·")
-    suffix = "  (see .ralph/logs)" if task.status == Status.FAILED else ""
+    suffix = "  (see .slop-churner/logs)" if task.status == Status.FAILED else ""
     print(f"    {icon} {task.status.value}{suffix}")
 
 
 def _print_plan(state: State, dry_run: bool) -> None:
-    print(f"\nralph: {len(state.tasks)} task(s) | base={state.base_branch} | "
+    print(f"\nslop-churner: {len(state.tasks)} task(s) | base={state.base_branch} | "
           f"test={state.test_cmd or '(none)'}{' | dry-run' if dry_run else ''}")
     for t in state.tasks:
         marker = "·" if t.status == Status.PENDING else t.status.value[0].upper()
@@ -205,7 +205,7 @@ def _print_plan(state: State, dry_run: bool) -> None:
 
 def _print_report(report: RunReport) -> None:
     print("\n" + "=" * 52)
-    print(f"ralph finished in {report.duration:.0f}s")
+    print(f"slop-churner finished in {report.duration:.0f}s")
     print(f"  done   : {len(report.done)}")
     for t in report.done:
         print(f"    ✓ {t.id}. {t.title}")

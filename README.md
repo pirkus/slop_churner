@@ -1,4 +1,4 @@
-# ralph
+# slop-churner
 
 An autonomous development loop. Give it a prompt; it decomposes the request
 into small tasks, then — for each task — runs an **implement → test → PR**
@@ -12,7 +12,7 @@ run is resumable and easy to inspect.
 
 ```
         ┌──────────────────────────────────────────────────────────────┐
-        │                          ralph run "…"                       │
+        │                          slop-churner run "…"                       │
         └──────────────────────────────────────────────────────────────┘
                                    │
                           ┌────────▼────────┐
@@ -31,7 +31,7 @@ run is resumable and easy to inspect.
         └──────────────────────────────────────────────────────────────────┘
 ```
 
-## Why "ralph"?
+## Why this design? (and the name)
 
 It follows the [Ralph](https://ghuntley.com/ralph/) idea: instead of one long,
 context-bloated agent session, you run many short, focused agent invocations
@@ -39,13 +39,16 @@ against a shared, durable artifact (here: the repo + a state file). Each
 invocation starts clean, does one job, and hands off. That makes the loop
 resilient to context rot, cheap to retry, and trivially resumable.
 
+The name is just more honest: it churns slop, over and over, until it's
+green.
+
 ## Install
 
 ```bash
-pip install -e .            # puts a `ralph` entrypoint on PATH
+pip install -e .            # puts a `slop-churner` entrypoint on PATH
 # or, without installing:
-python3 -m ralph --help                        # from the project root
-python3 /path/to/ralph/ralph-cli.py --help     # standalone launcher, from anywhere
+python3 -m slop_churner --help                        # from the project root
+python3 /path/to/slop-churner/slop-churner.py --help     # standalone launcher, from anywhere
 ```
 
 Requires Python ≥ 3.10, `git`, and an agent binary on `PATH` (default `pi`).
@@ -55,63 +58,63 @@ No third-party Python dependencies.
 
 ```bash
 cd /path/to/your/project
-ralph run "Add rate limiting to the /api/login endpoint using a token bucket"
+slop-churner run "Add rate limiting to the /api/login endpoint using a token bucket"
 ```
 
 What happens:
 
-1. **Plan** — an agent inspects your repo and writes `.ralph/tasks.json`:
+1. **Plan** — an agent inspects your repo and writes `.slop-churner/tasks.json`:
    an ordered list of small, self-contained tasks plus a `test_cmd`.
-2. **Per task** — ralph creates a worktree + branch (`ralph/<id>-<slug>`) off
+2. **Per task** — slop-churner creates a worktree + branch (`slop-churner/<id>-<slug>`) off
    the run's *staging branch* (so each task builds on the previous ones), then loops:
    - **implement/fix** — a fresh agent implements (or fixes) the task.
-   - **test** — ralph runs the test command in the worktree.
+   - **test** — slop-churner runs the test command in the worktree.
    - **PR** — commits and merges the branch into the staging branch
-     (`ralph/run`, or `ralph/run-<id>` in the web UI). Best-effort push if a
+     (`slop-churner/run`, or `slop-churner/run-<id>` in the web UI). Best-effort push if a
      remote exists. **Your base branch is not touched yet.**
    - If test or PR fails, the failure log is fed back into the **fix** step.
-3. **Review gate** — when the run finishes, ralph shows a per-file diff
+3. **Review gate** — when the run finishes, slop-churner shows a per-file diff
    (`base...staging`) and asks you to decide:
    - **accept** — the staging branch is merged into your base branch and all
-     ralph branches/worktrees are cleaned up (`ralph accept` / Accept button).
+     slop-churner branches/worktrees are cleaned up (`slop-churner accept` / Accept button).
    - **reject** — the staging branch and worktrees are discarded; your base
-     branch is exactly as it was before (`ralph reject` / Reject button).
+     branch is exactly as it was before (`slop-churner reject` / Reject button).
    - **later** — the staging branch stays around until you run
-     `ralph accept` or `ralph reject`. `ralph run --yes` auto-accepts.
+     `slop-churner accept` or `slop-churner reject`. `slop-churner run --yes` auto-accepts.
 
-A failed task keeps its worktree (under `<repo>-ralph/`) so you can inspect it.
+A failed task keeps its worktree (under `<repo>-slop-churner/`) so you can inspect it.
 
 ## Commands
 
 ```bash
-ralph run "PROMPT"            # plan (if needed) and execute all tasks
-ralph run "PROMPT" --dry-run  # plan and print the task list, do nothing else
-ralph run "PROMPT" --task 3   # run only task #3
-ralph run "PROMPT" --force-plan
-                              # re-plan even if .ralph/state.json exists
+slop-churner run "PROMPT"            # plan (if needed) and execute all tasks
+slop-churner run "PROMPT" --dry-run  # plan and print the task list, do nothing else
+slop-churner run "PROMPT" --task 3   # run only task #3
+slop-churner run "PROMPT" --force-plan
+                              # re-plan even if .slop-churner/state.json exists
 
-ralph status                  # show state, per-task progress, last errors
-ralph tasks                   # print full task descriptions + last error
-ralph retry 3                 # reset and re-run task #3
-ralph clean                   # remove leftover worktrees (keeps state)
-ralph web                     # serve the web dashboard + API (see below)
+slop-churner status                  # show state, per-task progress, last errors
+slop-churner tasks                   # print full task descriptions + last error
+slop-churner retry 3                 # reset and re-run task #3
+slop-churner clean                   # remove leftover worktrees (keeps state)
+slop-churner web                     # serve the web dashboard + API (see below)
 
-# after a run finishes, its work is staged on 'ralph/run' — decide:
-ralph accept                  # merge the staged run into the base branch
-ralph reject                  # discard the staged run (branch + worktrees)
-ralph run "PROMPT" --yes      # auto-accept at the end (no prompt)
+# after a run finishes, its work is staged on 'slop-churner/run' — decide:
+slop-churner accept                  # merge the staged run into the base branch
+slop-churner reject                  # discard the staged run (branch + worktrees)
+slop-churner run "PROMPT" --yes      # auto-accept at the end (no prompt)
 ```
 
 ## Web UI
 
-`ralph web` starts a local dashboard (stdlib only, no extra dependencies) where
+`slop-churner web` starts a local dashboard (stdlib only, no extra dependencies) where
 you can create runs, watch them progress live, and read every step's log:
 
 ```bash
-ralph web                          # http://127.0.0.1:8787
-ralph web --port 9000 --open       # different port, open a browser
-ralph web --db /path/to/ralph.db   # custom database location
-ralph web --no-http2               # HTTP/1.1 only
+slop-churner web                          # http://127.0.0.1:8787
+slop-churner web --port 9000 --open       # different port, open a browser
+slop-churner web --db /path/to/slop-churner.db   # custom database location
+slop-churner web --no-http2               # HTTP/1.1 only
 ```
 
 The web server speaks both HTTP/1.1 and cleartext HTTP/2 (h2c, prior
@@ -138,10 +141,10 @@ Features:
   (merge into the base branch) or **Reject** (discard the staging branch).
   The base branch is never modified until you accept.
 
-History is kept in a local SQLite database (`$RALPH_DB`, else
-`~/.ralph/ralph.db`) with `runs`, `tasks` and `steps` tables, so old runs and
+History is kept in a local SQLite database (`$SLOP_CHURNER_DB`, else
+`~/.slop-churner/slop-churner.db`) with `runs`, `tasks` and `steps` tables, so old runs and
 their logs stay available after a server restart. The UI and CLI share the
-same engine; the CLI's `.ralph/` artifacts (state file, file logs, worktrees)
+same engine; the CLI's `.slop-churner/` artifacts (state file, file logs, worktrees)
 are unchanged.
 
 A small JSON API is available for scripting:
@@ -178,31 +181,31 @@ are shared), enforced by the server.
 | `--test-timeout` | `900` | seconds per test run |
 | `--dry-run` | off | plan + print only |
 
-You can also set `RALPH_AGENT` instead of passing `--agent`.
+You can also set `SLOP_CHURNER_AGENT` instead of passing `--agent`.
 
 ## State & artifacts
 
-Everything ralph writes lives in two places, both easy to delete:
+Everything slop-churner writes lives in two places, both easy to delete:
 
-- **`.ralph/`** inside the target repo (auto-added to `.git/info/exclude`):
+- **`.slop-churner/`** inside the target repo (auto-added to `.git/info/exclude`):
   - `state.json` — task list, statuses, iteration counts, last errors.
   - `tasks.json` — the planner's raw output.
   - `logs/taskNN-<slug>/NN-<stage>.log` — every agent/test/PR transcript.
-- **`<repo>-ralph/`** as a sibling of the target repo: the per-task worktrees
+- **`<repo>-slop-churner/`** as a sibling of the target repo: the per-task worktrees
   (only surviving ones from failed tasks).
 
-To start completely fresh: `ralph clean` then delete `.ralph/`.
+To start completely fresh: `slop-churner clean` then delete `.slop-churner/`.
 
 ## The local "PR" and the acceptance gate
 
-`ralph` is git-native and works fully offline — a plain `git init` repo is
+`slop-churner` is git-native and works fully offline — a plain `git init` repo is
 enough; no remote required. Two-level model:
 
 1. **PR (per task)** — commit the worktree's changes, best-effort
    `git push` if a remote is configured, then `git merge --no-ff <task-branch>`
-   into the run's **staging branch** (`ralph/run`, or `ralph/run-<id>` in the
+   into the run's **staging branch** (`slop-churner/run`, or `slop-churner/run-<id>` in the
    web UI). Your base branch is not touched. See
-   `ralph/runner.py::open_pr`.
+   `slop_churner/runner.py::open_pr`.
 2. **Accept (per run)** — after the run finishes, the whole staging branch is
    one reviewable unit: `git diff base...staging` is what the UI/CLI shows.
    **Accept** runs `git merge --no-ff <staging>` into base and cleans up;

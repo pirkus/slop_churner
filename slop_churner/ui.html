@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ralph</title>
+<title>slop-churner</title>
 <style>
   :root {
     --bg: #0e1116;
@@ -157,7 +157,7 @@
 </head>
 <body>
 <header>
-  <h1>ralph</h1>
+  <h1>slop-churner</h1>
   <span class="tag">autonomous implement → test → PR loop</span>
   <span class="db" id="dbpath"></span>
 </header>
@@ -168,7 +168,7 @@
       <label for="f-repo">repo</label>
       <input type="text" id="f-repo" value="." placeholder="/path/to/repo">
       <label for="f-prompt">prompt</label>
-      <textarea id="f-prompt" required placeholder="What should ralph build?"></textarea>
+      <textarea id="f-prompt" required placeholder="What should slop-churner build?"></textarea>
       <details>
         <summary>parameters</summary>
         <div class="grid2">
@@ -424,7 +424,7 @@ function diffReview(id) {
 
   const title = document.createElement("div");
   title.className = "difftitle";
-  title.textContent = "ralph finished — review the changes before accepting";
+  title.textContent = "slop-churner finished — review the changes before accepting";
   wrap.appendChild(title);
 
   const stat = document.createElement("div");
@@ -541,7 +541,7 @@ function planReview(data) {
 
   const intro = document.createElement("div");
   intro.className = "nodetail";
-  intro.textContent = "ralph proposed the plan below — edit, add or remove tasks, then approve to start or reject to cancel.";
+  intro.textContent = "slop-churner proposed the plan below — edit, add or remove tasks, then approve to start or reject to cancel.";
   wrap.appendChild(intro);
 
   const list = document.createElement("div");

@@ -4,7 +4,7 @@ import textwrap
 
 PLANNER_SYSTEM = textwrap.dedent(
     """\
-    You are the planning stage of "ralph", an autonomous development loop.
+    You are the planning stage of "slop-churner", an autonomous development loop.
     Your ONLY job is to decompose a request into an ordered list of small,
     independently-verifiable tasks. You do NOT implement anything.
 
@@ -35,7 +35,7 @@ PLANNER_SYSTEM = textwrap.dedent(
 
 IMPLEMENT = textwrap.dedent(
     """\
-    You are the implementation stage of "ralph", an autonomous development loop.
+    You are the implementation stage of "slop-churner", an autonomous development loop.
     Work in the current directory, which is a dedicated git worktree for ONE task.
 
     TASK {task_id}: {title}
@@ -55,7 +55,7 @@ IMPLEMENT = textwrap.dedent(
 
 FIX = textwrap.dedent(
     """\
-    You are the fix stage of "ralph", an autonomous development loop.
+    You are the fix stage of "slop-churner", an autonomous development loop.
     Work in the current directory (a git worktree for task {task_id}: {title}).
 
     A previous attempt did not pass. Diagnose and fix the root cause.

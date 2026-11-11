@@ -9,8 +9,8 @@ from pathlib import Path
 class Config:
     repo: Path
     base_branch: str | None = None  # None = auto-detect current branch
-    run_branch: str | None = None   # staging branch; tasks merge here (default "ralph/run")
-    agent_cmd: str = os.environ.get("RALPH_AGENT", "pi")
+    run_branch: str | None = None   # staging branch; tasks merge here (default "slop-churner/run")
+    agent_cmd: str = os.environ.get("SLOP_CHURNER_AGENT", "pi")
     model: str | None = None
     max_iterations: int = 3          # implement/test/PR attempts per task
     max_tasks: int = 8               # cap on planned tasks
@@ -23,8 +23,8 @@ class Config:
     def __post_init__(self) -> None:
         self.repo = Path(self.repo).resolve()
         if not (self.repo / ".git").exists():
-            from .errors import RalphError
-            raise RalphError(f"{self.repo} is not a git repository")
+            from .errors import SlopChurnerError
+            raise SlopChurnerError(f"{self.repo} is not a git repository")
         if not self.base_branch:
             import subprocess
             r = subprocess.run(
@@ -34,25 +34,25 @@ class Config:
             self.base_branch = r.stdout.strip() or "main"
 
     @property
-    def ralph_dir(self) -> Path:
-        return self.repo / ".ralph"
+    def slop_churner_dir(self) -> Path:
+        return self.repo / ".slop-churner"
 
     @property
     def log_dir(self) -> Path:
-        return self.ralph_dir / "logs"
+        return self.slop_churner_dir / "logs"
 
     @property
     def worktrees_dir(self) -> Path:
-        return self.repo.parent / f"{self.repo.name}-ralph"
+        return self.repo.parent / f"{self.repo.name}-slop-churner"
 
     @property
     def state_path(self) -> Path:
-        return self.ralph_dir / "state.json"
+        return self.slop_churner_dir / "state.json"
 
     @property
     def tasks_path(self) -> Path:
-        return self.ralph_dir / "tasks.json"
+        return self.slop_churner_dir / "tasks.json"
 
     @property
     def prompt_path(self) -> Path:
-        return self.ralph_dir / "PROMPT.md"
+        return self.slop_churner_dir / "PROMPT.md"

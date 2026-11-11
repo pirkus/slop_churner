@@ -1,4 +1,4 @@
-"""Web UI + JSON API for ralph.
+"""Web UI + JSON API for slop-churner.
 
 Serves a single-page dashboard where you can:
   - create a run from a prompt + tunable parameters,
@@ -11,7 +11,7 @@ Stdlib http.server + sqlite3, plus the optional `h2` package for cleartext
 HTTP/2 (h2c, prior-knowledge on the same port). If `h2` is not installed the
 server transparently falls back to HTTP/1.1 only.
 
-    ralph web [--host 127.0.0.1] [--port 8787] [--db PATH] [--open] [--no-http2]
+    slop-churner web [--host 127.0.0.1] [--port 8787] [--db PATH] [--open] [--no-http2]
 """
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ except ImportError:  # h2 not installed -> HTTP/1.1 only
 
 from . import __version__, engine, events, gitutil, planner
 from .config import Config
-from .errors import RalphError
+from .errors import SlopChurnerError
 from .state import State
 from .store import Store, default_db_path
 
@@ -96,7 +96,7 @@ class WebSink:
         try:
             self.store.apply_event(self.run_id, name, data)
         except Exception as exc:  # never let DB hiccups kill the run
-            print(f"ralph web: store error: {exc}", file=sys.stderr)
+            print(f"slop-churner web: store error: {exc}", file=sys.stderr)
         self.hub.publish(self.run_id, {"name": name, "data": data})
 
 
@@ -147,7 +147,7 @@ def _planning_worker(ctx: "ServerContext", run_id: int, params: dict[str, Any]) 
             "test_cmd": plan.test_cmd,
         }})
         ctx.store.set_run_status(run_id, "awaiting_approval")
-    except (RalphError, ValueError, OSError) as exc:
+    except (SlopChurnerError, ValueError, OSError) as exc:
         ctx.hub.publish(run_id, {"name": "error", "data": {"message": str(exc)}})
         ctx.store.finish_run(run_id, "error", str(exc))
     except Exception as exc:  # unexpected
@@ -185,7 +185,7 @@ def _worker(ctx: "ServerContext", run_id: int, params: dict[str, Any],
             # one (set by _planning_worker / PUT /api/runs/{id}/plan).
             stored = ctx.store.get_plan(run_id)
             if stored is None or not stored["tasks"]:
-                raise RalphError("no approved plan for this run")
+                raise SlopChurnerError("no approved plan for this run")
             plan = planner.Plan(
                 test_cmd=stored["test_cmd"],
                 tasks=[planner.Task(id=int(t["task_id"]), title=t["title"],
@@ -205,12 +205,12 @@ def _worker(ctx: "ServerContext", run_id: int, params: dict[str, Any],
         if cancel.is_set():
             _close("cancelled", None)
         elif report.done:
-            # Work is staged on ralph/run-<id>; park until the user accepts
+            # Work is staged on slop-churner/run-<id>; park until the user accepts
             # or rejects it. The repo claim stays held until then.
             _close("awaiting_acceptance", None)
         else:
             _close("failed", None)
-    except (RalphError, ValueError, OSError) as exc:
+    except (SlopChurnerError, ValueError, OSError) as exc:
         ctx.hub.publish(run_id, {"name": "error", "data": {"message": str(exc)}})
         _close("error", str(exc))
     except Exception as exc:  # unexpected
@@ -259,7 +259,7 @@ class ServerContext:
 
 class Handler(BaseHTTPRequestHandler):
     ctx: ServerContext  # injected by serve()
-    server_version = f"ralph/{__version__}"
+    server_version = f"slop-churner/{__version__}"
 
     # -- helpers ------------------------------------------------------------
 
@@ -290,7 +290,7 @@ class Handler(BaseHTTPRequestHandler):
             return {}
 
     def log_message(self, fmt: str, *args: Any) -> None:  # quieter logs
-        sys.stderr.write("ralph web: " + fmt % args + "\n")
+        sys.stderr.write("slop-churner web: " + fmt % args + "\n")
 
     # -- routing ------------------------------------------------------------
 
@@ -369,13 +369,13 @@ class Handler(BaseHTTPRequestHandler):
                 "repo", "base", "agent", "model", "max_iterations", "max_tasks",
                 "budget", "test_cmd", "agent_timeout", "test_timeout",
             )})
-        except RalphError as exc:
+        except SlopChurnerError as exc:
             self._json(400, {"error": str(exc)})
             return
         # Validate config early (repo must be a git repo etc.) without running.
         try:
             _build_cfg({**(b or {}), "repo": repo})
-        except RalphError as exc:
+        except SlopChurnerError as exc:
             self.ctx.store.finish_run(run_id, "error", str(exc))
             self._json(400, {"error": str(exc), "run_id": run_id})
             return
@@ -389,7 +389,7 @@ class Handler(BaseHTTPRequestHandler):
         # Planning-only stage: the run parks in 'awaiting_approval' until an
         # explicit POST /api/runs/{id}/approve starts execution.
         t = threading.Thread(target=_planning_worker, args=(self.ctx, run_id, b),
-                             name=f"ralph-plan-{run_id}", daemon=True)
+                             name=f"slop-churner-plan-{run_id}", daemon=True)
         t.start()
         self._json(201, {"run_id": run_id})
 
@@ -456,7 +456,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.ctx.store.set_run_status(run_id, "running")
         t = threading.Thread(target=_worker, args=(self.ctx, run_id, params),
-                             name=f"ralph-run-{run_id}", daemon=True)
+                             name=f"slop-churner-run-{run_id}", daemon=True)
         t.start()
         self._json(200, {"ok": True})
 
@@ -503,7 +503,7 @@ class Handler(BaseHTTPRequestHandler):
         params = {**row["params"], "prompt": row["prompt"]}
         try:
             cfg = _build_cfg(params)
-        except RalphError as exc:
+        except SlopChurnerError as exc:
             self._json(400, {"error": str(exc)})
             return
         branch = gitutil.run_branch_name(run_id)
@@ -543,7 +543,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 state.run_branch = cfg.run_branch
             engine.accept_run(cfg, state)
-        except (RalphError, OSError) as exc:
+        except (SlopChurnerError, OSError) as exc:
             self._json(409, {"error": f"accept failed: {exc}"})
             return
         self.ctx.store.finish_run(run_id, "accepted", None)
@@ -577,7 +577,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 state.run_branch = cfg.run_branch
             engine.reject_run(cfg, state)
-        except (RalphError, OSError) as exc:
+        except (SlopChurnerError, OSError) as exc:
             self._json(409, {"error": f"discard failed: {exc}"})
             return
         self.ctx.store.finish_run(run_id, "rejected", None)
@@ -624,7 +624,7 @@ class Handler(BaseHTTPRequestHandler):
         # Reset the task row so progress shows fresh.
         self.ctx.store.upsert_task(run_id, {**task, "status": "pending", "iterations": 0})
         t = threading.Thread(target=_worker, args=(self.ctx, run_id, params, task_id),
-                             name=f"ralph-retry-{run_id}-{task_id}", daemon=True)
+                             name=f"slop-churner-retry-{run_id}-{task_id}", daemon=True)
         t.start()
         self._json(200, {"ok": True})
 
@@ -656,7 +656,7 @@ def _load_index_html() -> str:
     p = Path(__file__).resolve().parent / "ui.html"
     if p.exists():
         return p.read_text()
-    return "<h1>ralph</h1><p>UI asset 'ui.html' not found next to ralph/web.py</p>"
+    return "<h1>slop-churner</h1><p>UI asset 'ui.html' not found next to slop-churner/web.py</p>"
 
 
 _INDEX_HTML = _load_index_html()
@@ -859,14 +859,14 @@ if _H2:
                 else:
                     h._json(405, {"error": "method not allowed"})
             except Exception as exc:  # endpoint blew up: still answer
-                print(f"ralph web: h2 stream {stream_id} error: {exc}",
+                print(f"slop-churner web: h2 stream {stream_id} error: {exc}",
                       file=sys.stderr)
             if h._streaming:
                 return  # SSE already handled the stream out-of-band
             try:
                 self._send_response(stream_id, h)
             except H2Error as exc:  # peer reset the stream: drop it
-                print(f"ralph web: h2 stream {stream_id} dropped: {exc}",
+                print(f"slop-churner web: h2 stream {stream_id} dropped: {exc}",
                       file=sys.stderr)
 
         def run(self) -> None:
@@ -899,7 +899,7 @@ if _H2:
             except ConnectionError:
                 return  # peer closed the connection
             except H2Error as exc:
-                print(f"ralph web: h2 protocol error: {exc}", file=sys.stderr)
+                print(f"slop-churner web: h2 protocol error: {exc}", file=sys.stderr)
                 try:  # signal the peer, then drop the connection
                     self.conn.close_connection()
                     self.flush()
@@ -980,19 +980,19 @@ def serve(host: str = "127.0.0.1", port: int = 8787,
         proto = "HTTP/2 (h2c) + HTTP/1.1"
     else:
         if http2:
-            print("ralph web: 'h2' is not installed; serving HTTP/1.1 only",
+            print("slop-churner web: 'h2' is not installed; serving HTTP/1.1 only",
                   file=sys.stderr)
         httpd = ThreadingHTTPServer((host, port), Handler)
         proto = "HTTP/1.1"
     url = f"http://{host}:{port}/"
-    print(f"ralph web: serving {url}  [{proto}]  (db: {ctx.store.path})")
-    print("ralph web: press Ctrl-C to stop")
+    print(f"slop-churner web: serving {url}  [{proto}]  (db: {ctx.store.path})")
+    print("slop-churner web: press Ctrl-C to stop")
     if open_browser:
         webbrowser.open(url)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\nralph web: shutting down")
+        print("\nslop-churner web: shutting down")
     finally:
         httpd.server_close()
         ctx.store.close()

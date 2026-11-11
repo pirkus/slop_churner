@@ -1,4 +1,4 @@
-"""Offline smoke test: drives the whole ralph loop with a stubbed agent.
+"""Offline smoke test: drives the whole slop-churner loop with a stubbed agent.
 
 Run:  python3 tests/smoke.py
 """
@@ -12,10 +12,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ralph import planner, runner  # noqa: E402
-from ralph.config import Config  # noqa: E402
-from ralph.engine import run  # noqa: E402
-from ralph.agent import AgentResult  # noqa: E402
+from slop_churner import planner, runner  # noqa: E402
+from slop_churner.config import Config  # noqa: E402
+from slop_churner.engine import run  # noqa: E402
+from slop_churner.agent import AgentResult  # noqa: E402
 
 
 def sh(cwd, *a):
@@ -24,8 +24,8 @@ def sh(cwd, *a):
 
 def make_repo(root: Path) -> None:
     sh(root, "git", "init", "-b", "main")
-    sh(root, "git", "config", "user.email", "ralph@test")
-    sh(root, "git", "config", "user.name", "ralph")
+    sh(root, "git", "config", "user.email", "slop-churner@test")
+    sh(root, "git", "config", "user.name", "slop-churner")
     (root / "app.py").write_text("def add(a, b):\n    return a + b\n")
     (root / "test_app.py").write_text(
         "from app import add\n\ndef test_add():\n    assert add(1, 2) == 3\n"
@@ -82,7 +82,7 @@ def stub_tests(cfg, wt, test_cmd):
 
 
 def main() -> int:
-    tmp = Path(tempfile.mkdtemp(prefix="ralph-smoke-"))
+    tmp = Path(tempfile.mkdtemp(prefix="slop-churner-smoke-"))
     repo = tmp / "proj"
     repo.mkdir()
     make_repo(repo)
@@ -106,8 +106,8 @@ def main() -> int:
     # The change must be STAGED on the run branch, not yet in main.
     branches = subprocess.run(["git", "branch"], cwd=str(repo),
                               capture_output=True, text=True).stdout
-    assert "ralph/run" in branches, f"staging branch should exist:\n{branches}"
-    sh(repo, "git", "checkout", "ralph/run")
+    assert "slop-churner/run" in branches, f"staging branch should exist:\n{branches}"
+    sh(repo, "git", "checkout", "slop-churner/run")
     staged = "def subtract" in (repo / "app.py").read_text()
     assert staged, "subtract should be staged on the run branch"
     sh(repo, "git", "checkout", "main")
@@ -115,27 +115,27 @@ def main() -> int:
         "main must stay clean until the run is accepted"
 
     # Accept the run: work lands in main, staging + task branches cleaned up.
-    from ralph import engine
-    from ralph.state import State
+    from slop_churner import engine
+    from slop_churner.state import State
     state = State.load(cfg.state_path)
-    assert state is not None and state.run_branch == "ralph/run", \
+    assert state is not None and state.run_branch == "slop-churner/run", \
         "state must record the staging branch"
     engine.accept_run(cfg, state)
     assert "def subtract" in (repo / "app.py").read_text(), \
         "subtract should be merged into main after accept"
     sh(repo, "git", "log", "--oneline", "-5")
 
-    # No leftover worktrees or ralph branches.
+    # No leftover worktrees or slop-churner branches.
     wts = subprocess.run(["git", "worktree", "list"], cwd=str(repo),
                          capture_output=True, text=True).stdout
     assert wts.count("\n") <= 1, f"expected no extra worktrees, got:\n{wts}"
     branches = subprocess.run(["git", "branch"], cwd=str(repo),
                               capture_output=True, text=True).stdout
-    assert "ralph/" not in branches, f"branches should be cleaned up:\n{branches}"
+    assert "slop-churner/" not in branches, f"branches should be cleaned up:\n{branches}"
     assert state.run_branch is None, "state must clear run_branch after accept"
 
     # Reject path on a fresh repo: staging work is discarded, base untouched.
-    tmp2 = Path(tempfile.mkdtemp(prefix="ralph-smoke-reject-"))
+    tmp2 = Path(tempfile.mkdtemp(prefix="slop-churner-smoke-reject-"))
     repo2 = tmp2 / "proj"
     repo2.mkdir()
     make_repo(repo2)
@@ -147,23 +147,23 @@ def main() -> int:
     r2 = run(cfg2, "add a subtract function")
     assert r2.all_done
     state2 = State.load(cfg2.state_path)
-    assert state2.run_branch == "ralph/run"
+    assert state2.run_branch == "slop-churner/run"
 
     # diff_overview should report the staged change while it is pending.
-    from ralph import gitutil
-    ov = gitutil.diff_overview(repo2, "main", "ralph/run")
+    from slop_churner import gitutil
+    ov = gitutil.diff_overview(repo2, "main", "slop-churner/run")
     assert any(f["path"] == "app.py" and f["added"] > 0 for f in ov["files"]), ov
     assert ov["added"] > 0 and ov["deleted"] >= 0
     assert any("app.py" in f["patch"] for f in ov["files"] if f["patch"])
     assert ov["commits"], "commit list should not be empty"
     # Missing-branch path degrades gracefully.
-    ov2 = gitutil.diff_overview(repo2, "main", "ralph/nope")
+    ov2 = gitutil.diff_overview(repo2, "main", "slop-churner/nope")
     assert ov2["files"] == [] and ov2["added"] == 0
 
     engine.reject_run(cfg2, state2)
     branches = subprocess.run(["git", "branch"], cwd=str(repo2),
                               capture_output=True, text=True).stdout
-    assert "ralph/" not in branches, f"staging branch should be gone:\n{branches}"
+    assert "slop-churner/" not in branches, f"staging branch should be gone:\n{branches}"
     assert "def subtract" not in (repo2 / "app.py").read_text(), \
         "main must be untouched after reject"
     wts = subprocess.run(["git", "worktree", "list"], cwd=str(repo2),
@@ -176,7 +176,7 @@ def main() -> int:
 
 def main_plan_supplied() -> int:
     """engine.run with a pre-supplied planner.Plan: planner agent must never run."""
-    tmp = Path(tempfile.mkdtemp(prefix="ralph-smoke-plan-"))
+    tmp = Path(tempfile.mkdtemp(prefix="slop-churner-smoke-plan-"))
     repo = tmp / "proj"
     repo.mkdir()
     make_repo(repo)
@@ -232,8 +232,8 @@ def main_plan_supplied() -> int:
     # Both supplied tasks must be staged on the run branch...
     branches = subprocess.run(["git", "branch"], cwd=str(repo),
                               capture_output=True, text=True).stdout
-    assert "ralph/run" in branches, f"staging branch should exist:\n{branches}"
-    sh(repo, "git", "checkout", "ralph/run")
+    assert "slop-churner/run" in branches, f"staging branch should exist:\n{branches}"
+    sh(repo, "git", "checkout", "slop-churner/run")
     staged_src = (repo / "app.py").read_text()
     assert "def subtract" in staged_src and "def multiply" in staged_src, \
         "both supplied tasks should be staged on the run branch"
@@ -242,8 +242,8 @@ def main_plan_supplied() -> int:
         "main must stay clean until accept"
 
     # ...and accept lands both in main (task 2 built on task 1's work).
-    from ralph import engine
-    from ralph.state import State
+    from slop_churner import engine
+    from slop_churner.state import State
     state = State.load(cfg.state_path)
     engine.accept_run(cfg, state)
     main_src = (repo / "app.py").read_text()
@@ -256,7 +256,7 @@ def main_plan_supplied() -> int:
     assert wts.count("\n") <= 1, f"expected no extra worktrees, got:\n{wts}"
     branches = subprocess.run(["git", "branch"], cwd=str(repo),
                               capture_output=True, text=True).stdout
-    assert "ralph/" not in branches, f"branches should be cleaned up:\n{branches}"
+    assert "slop-churner/" not in branches, f"branches should be cleaned up:\n{branches}"
 
     print("\nSMOKE TEST (pre-supplied plan) PASSED")
     return 0
@@ -264,10 +264,10 @@ def main_plan_supplied() -> int:
 
 def main_streaming() -> int:
     """run_agent streams stdout lines to on_output as they arrive."""
-    from ralph import agent
+    from slop_churner import agent
 
-    tmp = Path(tempfile.mkdtemp(prefix="ralph-stream-"))
-    # agent_cmd must accept the "-p <prompt>" args ralph passes it.
+    tmp = Path(tempfile.mkdtemp(prefix="slop-churner-stream-"))
+    # agent_cmd must accept the "-p <prompt>" args slop-churner passes it.
     script = tmp / "fake_agent"
     script.write_text("#!/bin/sh\necho a\nsleep 0.3\necho b\n")
     script.chmod(0o755)

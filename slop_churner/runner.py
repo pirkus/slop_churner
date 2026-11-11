@@ -8,7 +8,7 @@ from pathlib import Path
 from . import events, gitutil, prompts
 from .agent import run_agent
 from .config import Config
-from .errors import RalphError
+from .errors import SlopChurnerError
 from .state import State, Status, Task
 
 
@@ -57,7 +57,7 @@ def open_pr(cfg: Config, state: State, task: Task, wt: Path) -> StageResult:
     The base branch is only touched later, when the user accepts the run.
     """
     try:
-        if not gitutil.commit_all(wt, f"{task.title} (ralph task {task.id})"):
+        if not gitutil.commit_all(wt, f"{task.title} (slop-churner task {task.id})"):
             # Nothing new this iteration; the branch may already hold earlier work.
             pass
         target = cfg.run_branch or state.base_branch
@@ -66,7 +66,7 @@ def open_pr(cfg: Config, state: State, task: Task, wt: Path) -> StageResult:
             note = gitutil.push(wt, target)
         # Merge into the staging branch in the main repo.
         gitutil.merge_into(cfg.repo, task.branch or "", target,
-                           f"ralph: {task.title}")
+                           f"slop-churner: {task.title}")
         extra = f"\n{note}" if note else ""
         return StageResult(True, f"merged {task.branch} into {target}{extra}", 0)
     except gitutil.GitError as exc:
@@ -160,7 +160,7 @@ def run_task(
             continue
 
         committed_any = committed_any or gitutil.commit_all(
-            wt, f"{task.title} (ralph task {task.id}, attempt {attempt})"
+            wt, f"{task.title} (slop-churner task {task.id}, attempt {attempt})"
         )
 
         # 2) TEST ------------------------------------------------------------
@@ -228,8 +228,8 @@ def run_task(
 
 def _prepare_base(repo: Path, base: str) -> None:
     if not gitutil.is_clean(repo):
-        raise RalphError(
-            f"base repo {repo} is not clean; commit or stash before running ralph"
+        raise SlopChurnerError(
+            f"base repo {repo} is not clean; commit or stash before running slop-churner"
         )
     cur = gitutil.current_branch(repo)
     if cur != base:

@@ -8,7 +8,7 @@ from pathlib import Path
 from . import events, prompts
 from .agent import run_agent
 from .config import Config
-from .errors import RalphError
+from .errors import SlopChurnerError
 from .state import State, Task
 
 
@@ -28,29 +28,29 @@ def _extract_json(text: str) -> dict:
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
-        raise RalphError(f"planner returned no JSON object:\n{text[:500]}")
+        raise SlopChurnerError(f"planner returned no JSON object:\n{text[:500]}")
     candidate = text[start : end + 1]
     try:
         return json.loads(candidate)
     except json.JSONDecodeError as exc:
-        raise RalphError(f"planner returned invalid JSON: {exc}\n{candidate[:500]}") from exc
+        raise SlopChurnerError(f"planner returned invalid JSON: {exc}\n{candidate[:500]}") from exc
 
 
 def _validate(obj: dict, max_tasks: int) -> Plan:
     raw_tasks = obj.get("tasks")
     if not isinstance(raw_tasks, list) or not raw_tasks:
-        raise RalphError("planner JSON must contain a non-empty 'tasks' array")
+        raise SlopChurnerError("planner JSON must contain a non-empty 'tasks' array")
     if len(raw_tasks) > max_tasks:
-        raise RalphError(f"planner returned {len(raw_tasks)} tasks (max {max_tasks})")
+        raise SlopChurnerError(f"planner returned {len(raw_tasks)} tasks (max {max_tasks})")
 
     tasks: list[Task] = []
     for i, item in enumerate(raw_tasks, start=1):
         if not isinstance(item, dict):
-            raise RalphError(f"task #{i} is not an object")
+            raise SlopChurnerError(f"task #{i} is not an object")
         title = str(item.get("title") or "").strip()
         description = str(item.get("description") or "").strip()
         if not title or not description:
-            raise RalphError(f"task #{i} is missing title or description")
+            raise SlopChurnerError(f"task #{i} is missing title or description")
         tasks.append(Task(id=i, title=title, description=description))
 
     test_cmd = obj.get("test_cmd")
@@ -87,7 +87,7 @@ def plan(cfg: Config, request: str, sink: events.Sink | None = None) -> Plan:
     )
     # Hard infra failures (missing binary, timeout) are not retryable here.
     if result.returncode in (127, -1) or (not result.ok and not result.output.strip()):
-        raise RalphError(
+        raise SlopChurnerError(
             f"planner agent could not run (rc={result.returncode}): "
             f"{result.output.strip() or 'no output'}"
         )

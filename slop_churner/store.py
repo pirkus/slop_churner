@@ -1,10 +1,10 @@
 """SQLite persistence for runs, tasks and per-step logs.
 
 The web UI is the primary consumer, but the store is deliberately UI-free:
-it just maps ralph's event stream (see engine.run/runner.run_task `sink`)
+it just maps slop-churner's event stream (see engine.run/runner.run_task `sink`)
 into a small local database so history survives restarts.
 
-DB location: $RALPH_DB, else ~/.ralph/ralph.db.
+DB location: $SLOP_CHURNER_DB, else ~/.slop-churner/slop-churner.db.
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def _now() -> str:
 
 
 def default_db_path() -> Path:
-    return Path(os.environ.get("RALPH_DB") or "~/.ralph/ralph.db").expanduser()
+    return Path(os.environ.get("SLOP_CHURNER_DB") or "~/.slop-churner/slop-churner.db").expanduser()
 
 
 _SCHEMA = """

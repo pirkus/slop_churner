@@ -6,7 +6,7 @@ from pathlib import Path
 
 from . import __version__, engine, gitutil
 from .config import Config
-from .errors import RalphError
+from .errors import SlopChurnerError
 from .state import State, Status
 
 
@@ -55,11 +55,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not args.request:
         cfg.prompt_path.parent.mkdir(parents=True, exist_ok=True)
         cfg.prompt_path.write_text(
-            "Describe what you want built. ralph will plan tasks, then for each\n"
+            "Describe what you want built. slop-churner will plan tasks, then for each\n"
             "task run an implement -> test -> PR(merge) loop, fixing on failure.\n"
         )
         print(f"no prompt given; wrote a starter to {cfg.prompt_path}")
-        print("edit it, then run: ralph run --repo .")
+        print("edit it, then run: slop-churner run --repo .")
         return 1
     report = engine.run(
         cfg,
@@ -83,7 +83,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             engine.reject_run(cfg, state)
             print(f"rejected: staging branch {cfg.run_branch} discarded")
         else:
-            print(f"kept for later: review with `ralph accept` or `ralph reject` "
+            print(f"kept for later: review with `slop-churner accept` or `slop-churner reject` "
                   f"(staging branch {cfg.run_branch})")
             ok = True  # the work is done; the decision is simply pending
     return 0 if ok else 1
@@ -93,7 +93,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     cfg = _cfg(args)
     state = State.load(cfg.state_path)
     if state is None:
-        print("no ralph state found in", cfg.repo, "(run: ralph run \"...\")")
+        print("no slop-churner state found in", cfg.repo, "(run: slop-churner run \"...\")")
         return 1
     print(f"repo : {cfg.repo}")
     print(f"base : {state.base_branch}")
@@ -199,10 +199,10 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="ralph",
-        description="Ralph: an autonomous implement -> test -> PR loop driven by a coding agent.",
+        prog="slop-churner",
+        description="Slop-churner: an autonomous implement -> test -> PR loop driven by a coding agent.",
     )
-    p.add_argument("--version", action="version", version=f"ralph {__version__}")
+    p.add_argument("--version", action="version", version=f"slop-churner {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def common(sp: argparse.ArgumentParser) -> None:
@@ -222,7 +222,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--dry-run", action="store_true", help="plan and print, do not run agents/git")
 
     sp = sub.add_parser("run", help="plan tasks and execute them")
-    sp.add_argument("request", nargs="?", help="what to build (or edit .ralph/PROMPT.md)")
+    sp.add_argument("request", nargs="?", help="what to build (or edit .slop-churner/PROMPT.md)")
     sp.add_argument("--task", type=int, default=None, help="run only this task id")
     sp.add_argument("--force-plan", action="store_true", help="re-plan even if state exists")
     sp.add_argument("--yes", action="store_true",
@@ -263,7 +263,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--host", default="127.0.0.1", help="bind address (default: 127.0.0.1)")
     sp.add_argument("--port", type=int, default=8787, help="port (default: 8787)")
     sp.add_argument("--db", default=None,
-                    help="sqlite path (default: $RALPH_DB or ~/.ralph/ralph.db)")
+                    help="sqlite path (default: $SLOP_CHURNER_DB or ~/.slop-churner/slop-churner.db)")
     sp.add_argument("--open", action="store_true", help="open a browser window")
     sp.add_argument("--no-http2", action="store_true",
                     help="serve HTTP/1.1 only (disable cleartext HTTP/2/h2c)")
@@ -277,7 +277,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except RalphError as exc:
+    except SlopChurnerError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

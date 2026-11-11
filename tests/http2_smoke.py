@@ -37,8 +37,8 @@ except ImportError:
     print("h2 not installed; skipping HTTP/2 smoke test")
     sys.exit(0)
 
-from ralph import __version__  # noqa: E402
-from ralph.web import (  # noqa: E402
+from slop_churner import __version__  # noqa: E402
+from slop_churner.web import (  # noqa: E402
     Handler,
     ServerContext,
     _DualRequestHandler,
@@ -46,7 +46,7 @@ from ralph.web import (  # noqa: E402
     _ThreadingTCPServer,
 )
 
-assert _H2, "ralph.web must see the h2 package when the test can"
+assert _H2, "slop-churner.web must see the h2 package when the test can"
 
 
 class H2Client:
@@ -188,8 +188,8 @@ def h2_checks(ctx: ServerContext, port: int, db: Path) -> None:
 
 
 def main() -> int:
-    tmp = Path(tempfile.mkdtemp(prefix="ralph-h2-smoke-"))
-    db = tmp / "ralph.db"
+    tmp = Path(tempfile.mkdtemp(prefix="slop-churner-h2-smoke-"))
+    db = tmp / "slop-churner.db"
     ctx = ServerContext(db)
     Handler.ctx = ctx
     httpd = _ThreadingTCPServer(("127.0.0.1", 0), _DualRequestHandler)

@@ -4,10 +4,12 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+.venv/
 
-# ralph runtime artifacts (in case someone runs ralph on itself)
-.ralph/
-*-ralph/
+# slop-churner runtime artifacts (in case someone runs it on itself)
+.slop-churner/
+*-slop-churner/
+slop-churner.db
 
 # Editors / OS
 .vscode/

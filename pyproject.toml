@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ralph"
+name = "slop-churner"
 version = "0.1.0"
 description = "An autonomous implement -> test -> PR loop driven by a coding agent."
 readme = "README.md"
@@ -14,10 +14,10 @@ dependencies = [
 ]
 
 [project.scripts]
-ralph = "ralph.cli:main"
+slop-churner = "slop_churner.cli:main"
 
 [tool.setuptools]
-packages = ["ralph"]
+packages = ["slop_churner"]
 
 [tool.setuptools.package-data]
-ralph = ["ui.html"]
+slop_churner = ["ui.html"]
