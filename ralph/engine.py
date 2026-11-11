@@ -24,7 +24,8 @@ class RunReport:
         return not self.failed
 
 
-def _load_or_plan(cfg: Config, request: str, *, force_plan: bool) -> State:
+def _load_or_plan(cfg: Config, request: str, *, force_plan: bool,
+                  sink: events.Sink | None = None) -> State:
     existing = State.load(cfg.state_path)
     if existing is not None and not force_plan:
         # Resume: keep the already-planned task list and any progress,
@@ -33,7 +34,7 @@ def _load_or_plan(cfg: Config, request: str, *, force_plan: bool) -> State:
         if cfg.test_cmd:
             existing.test_cmd = cfg.test_cmd
         return existing
-    plan = planner.plan(cfg, request)
+    plan = planner.plan(cfg, request, sink=sink)
     state = planner.build_state(cfg, request, plan)
     state.save(cfg.state_path)
     return state
@@ -70,7 +71,7 @@ def run(
         if needs_plan:
             print(f"ralph: planning tasks with '{cfg.agent_cmd}'… "
                   f"(first line below appears when it returns)", flush=True)
-        state = _load_or_plan(cfg, request, force_plan=force_plan)
+        state = _load_or_plan(cfg, request, force_plan=force_plan, sink=emit)
 
     emit("run_started", {
         "repo": str(cfg.repo),
