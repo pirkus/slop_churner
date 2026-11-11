@@ -177,6 +177,7 @@ def cmd_web(args: argparse.Namespace) -> int:
         port=args.port,
         db=args.db,
         open_browser=args.open,
+        http2=not args.no_http2,
     )
 
 
@@ -264,6 +265,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--db", default=None,
                     help="sqlite path (default: $RALPH_DB or ~/.ralph/ralph.db)")
     sp.add_argument("--open", action="store_true", help="open a browser window")
+    sp.add_argument("--no-http2", action="store_true",
+                    help="serve HTTP/1.1 only (disable cleartext HTTP/2/h2c)")
     sp.set_defaults(func=cmd_web)
 
     return p

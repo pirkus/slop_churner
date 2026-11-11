@@ -7,15 +7,19 @@ Serves a single-page dashboard where you can:
   - browse every step's log (implement/fix, test, pr),
   - cancel a running job or retry a failed task.
 
-Zero third-party dependencies: stdlib http.server + sqlite3.
+Stdlib http.server + sqlite3, plus the optional `h2` package for cleartext
+HTTP/2 (h2c, prior-knowledge on the same port). If `h2` is not installed the
+server transparently falls back to HTTP/1.1 only.
 
-    ralph web [--host 127.0.0.1] [--port 8787] [--db PATH] [--open]
+    ralph web [--host 127.0.0.1] [--port 8787] [--db PATH] [--open] [--no-http2]
 """
 from __future__ import annotations
 
 import json
 import queue
 import re
+import socket
+import socketserver
 import sys
 import threading
 import webbrowser
@@ -24,11 +28,29 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+# Optional HTTP/2 support: the project is otherwise stdlib-only, so the
+# whole h2c path is gated behind this import and degrades to HTTP/1.1.
+try:
+    import h2.config
+    import h2.connection
+    import h2.events
+    from h2.exceptions import H2Error
+    _H2 = True
+    # h2 >= 4.2 emits RequestReceived; older 4.x emits the legacy Headers
+    # event. Both expose .stream_id/.headers/.stream_ended identically.
+    _H2_REQ_EVENT = (getattr(h2.events, "RequestReceived", None)
+                     or h2.events.Headers)
+except ImportError:  # h2 not installed -> HTTP/1.1 only
+    _H2 = False
+
 from . import __version__, engine, events, gitutil, planner
 from .config import Config
 from .errors import RalphError
 from .state import State
 from .store import Store, default_db_path
+
+# RFC 7540 client connection preface ("prior knowledge" h2c detection).
+_H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
 # ---------------------------------------------------------------------------
 # Live-event fan-out for SSE
@@ -113,7 +135,10 @@ def _planning_worker(ctx: "ServerContext", run_id: int, params: dict[str, Any]) 
     try:
         ctx.store.set_run_status(run_id, "planning")
         cfg = _build_cfg(params)
-        plan = planner.plan(cfg, params.get("prompt", ""))
+        # Stream the planner's live output to the UI over SSE (agent_output
+        # is live-only; the store ignores it).
+        sink = WebSink(ctx.store, ctx.hub, run_id)
+        plan = planner.plan(cfg, params.get("prompt", ""), sink=sink)
         for t in plan.tasks:
             ctx.store.upsert_task(run_id, t.to_dict())
         ctx.store.set_plan_test_cmd(run_id, plan.test_cmd)
@@ -638,16 +663,329 @@ _INDEX_HTML = _load_index_html()
 
 
 # ---------------------------------------------------------------------------
+# Cleartext HTTP/2 (h2c) on the same port
+#
+# Every connection is sniffed on its first bytes: the h2 client connection
+# preface (RFC 7540 "prior knowledge") drives an h2.connection.H2Connection,
+# anything else falls back to the stdlib HTTP/1.1 Handler unchanged.
+# Handler's routing (do_GET/do_POST/do_PUT) is reused as-is; only the I/O
+# primitives differ.
+# ---------------------------------------------------------------------------
+
+if _H2:
+
+    class _HeadReader:
+        """rfile for the HTTP/1.1 fallback path: replays the leading bytes
+        we already inspected for the h2 preface, then proxies to the socket.
+        """
+
+        def __init__(self, head: bytes, underlying: Any) -> None:
+            self._head = head
+            self._u = underlying
+
+        def readline(self, n: int = -1) -> bytes:
+            buf = self._head
+            self._head = b""
+            if b"\n" not in buf:
+                buf += self._u.readline()
+                if b"\n" not in buf:  # incomplete request line / EOF
+                    self._head = buf
+                    return b""
+            line, rest = buf.split(b"\n", 1)
+            if rest:
+                self._head = rest + b"\n"
+            return line + b"\n"
+
+        def read(self, n: int = -1) -> bytes:
+            if self._head:
+                data, self._head = self._head, b""
+                if n == -1:
+                    return data + self._u.read()
+                if len(data) >= n:
+                    self._head = data[n:]
+                    return data[:n]
+                return data + self._u.read(n - len(data))
+            return self._u.read(n)
+
+    class _H2Handler(Handler):
+        """One h2 request/stream, reusing Handler's endpoint methods.
+
+        Same routing as the HTTP/1.1 Handler; only the request source and
+        the response sink differ (response frames are written by the
+        _H2Session after the endpoint method returns).
+        """
+
+        def __init__(self, session: "_H2Session", stream_id: int) -> None:
+            self.session = session
+            self.stream_id = stream_id
+            self.path = "/"
+            self.headers: dict[str, str] = {}
+            self._request_body = b""
+            # Defaults: an endpoint that blew up still gets a JSON 500.
+            self._status = 500
+            self._resp_headers: list[tuple[str, str]] = [
+                ("content-type", "application/json")]
+            self._chunks: list[bytes] = []
+            self._streaming = False  # set by _sse(): stream handled out-of-band
+
+        # -- response primitives (h2 replacements of send_response & co) ----
+
+        def _emit(self, code: int, content_type: str, body: bytes) -> None:
+            self._status = code
+            self._resp_headers = [("content-type", content_type)]
+            self._chunks = [body] if body else []
+
+        def _json(self, code: int, payload: Any) -> None:
+            self._emit(code, "application/json",
+                       json.dumps(payload, default=str).encode())
+
+        def _html(self, code: int, text: str) -> None:
+            self._emit(code, "text/html; charset=utf-8", text.encode())
+
+        def _body(self) -> dict[str, Any]:
+            if not self._request_body:
+                return {}
+            try:
+                data = json.loads(self._request_body.decode())
+                return data if isinstance(data, dict) else {}
+            except json.JSONDecodeError:
+                return {}
+
+        def _sse(self, run_id: int) -> None:
+            if self.session.ctx.store.get_run(run_id) is None:
+                self._json(404, {"error": "no such run"})
+                return
+            self._streaming = True
+            q = self.session.ctx.hub.subscribe(run_id)
+            try:
+                self.session.send_head(self.stream_id, 200, {
+                    "content-type": "text/event-stream",
+                    "cache-control": "no-cache",
+                })
+                while True:
+                    try:
+                        ev = q.get(timeout=15)
+                        chunk = f"data: {json.dumps(ev)}\n\n".encode()
+                    except queue.Empty:
+                        chunk = b": ping\n\n"
+                    self.session.send_data(self.stream_id, chunk)
+                    self.session.flush()  # deliver each event as it arrives
+            except Exception:  # client gone / stream reset: stop the stream
+                pass
+            finally:
+                self.session.ctx.hub.unsubscribe(run_id, q)
+
+    class _H2Session:
+        """One h2c connection: h2.connection.H2Connection on a raw socket.
+
+        Handles SETTINGS, HEADERS, DATA, RST_STREAM and WINDOW_UPDATE;
+        requests are mapped onto Handler's routing and responses are sent
+        as HEADERS + DATA frames.
+        """
+
+        def __init__(self, sock: socket.socket, head: bytes,
+                     ctx: ServerContext) -> None:
+            self.sock = sock
+            self.ctx = ctx
+            self.conn = h2.connection.H2Connection(
+                h2.config.H2Configuration(client_side=False,
+                                          header_encoding="utf-8"))
+            self.conn.initiate_connection()
+            self._recv_buf = head
+            self._heads: dict[int, list[tuple[str, str]]] = {}
+            self._bodies: dict[int, list[bytes]] = {}
+
+        # -- low-level io ----------------------------------------------------
+
+        def _recv(self, n: int) -> bytes:
+            data = self._recv_buf
+            self._recv_buf = b""
+            if len(data) < n:
+                data += self.sock.recv(n - len(data))
+            if not data:
+                raise ConnectionError("client closed the connection")
+            return data
+
+        def flush(self) -> None:
+            out = self.conn.data_to_send()
+            if out:
+                self.sock.sendall(out)
+
+        # -- stream writers ----------------------------------------------------
+
+        def send_head(self, stream_id: int, status: int,
+                      headers: dict[str, str]) -> None:
+            self.conn.send_headers(
+                stream_id,
+                [(":status", str(status))] + list(headers.items()),
+                end_stream=False)
+            self.flush()
+
+        def send_data(self, stream_id: int, data: bytes) -> None:
+            self.conn.send_data(stream_id, data, end_stream=False)
+            self.flush()
+
+        def _send_response(self, stream_id: int, h: _H2Handler) -> None:
+            self.conn.send_headers(
+                stream_id,
+                [(":status", str(h._status))] + h._resp_headers,
+                end_stream=not h._chunks)
+            self.flush()
+            for i, chunk in enumerate(h._chunks):
+                self.conn.send_data(
+                    stream_id, chunk,
+                    end_stream=(i == len(h._chunks) - 1))
+                self.flush()
+
+        # -- event handling ----------------------------------------------------
+
+        def _dispatch(self, stream_id: int) -> None:
+            headers = self._heads.pop(stream_id, [])
+            body = b"".join(self._bodies.pop(stream_id, ()))
+            pseudo = {k: v for k, v in headers if k.startswith(":")}
+            fields = {k: v for k, v in headers if not k.startswith(":")}
+            h = _H2Handler(self, stream_id)
+            h.path = pseudo.get(":path", "/")
+            h.headers = fields
+            h._request_body = body
+            method = pseudo.get(":method", "GET").upper()
+            try:
+                if method in ("GET", "HEAD"):
+                    h.do_GET()
+                elif method == "POST":
+                    h.do_POST()
+                elif method == "PUT":
+                    h.do_PUT()
+                else:
+                    h._json(405, {"error": "method not allowed"})
+            except Exception as exc:  # endpoint blew up: still answer
+                print(f"ralph web: h2 stream {stream_id} error: {exc}",
+                      file=sys.stderr)
+            if h._streaming:
+                return  # SSE already handled the stream out-of-band
+            try:
+                self._send_response(stream_id, h)
+            except H2Error as exc:  # peer reset the stream: drop it
+                print(f"ralph web: h2 stream {stream_id} dropped: {exc}",
+                      file=sys.stderr)
+
+        def run(self) -> None:
+            try:
+                while True:
+                    events = self.conn.receive_data(self._recv(65536))
+                    self.flush()
+                    for ev in events:
+                        if isinstance(ev, h2.events.StreamReset):
+                            self._heads.pop(ev.stream_id, None)
+                            self._bodies.pop(ev.stream_id, None)
+                        elif isinstance(ev, h2.events.WindowUpdated):
+                            # A received WINDOW_UPDATE grows our send window;
+                            # h2 already applied it, nothing to answer.
+                            # (Returning window is done via
+                            # acknowledge_received_data after consuming DATA.)
+                            pass
+                        elif isinstance(ev, h2.events.DataReceived):
+                            self.conn.acknowledge_received_data(
+                                len(ev.data), ev.stream_id)
+                            self._bodies.setdefault(ev.stream_id, []).append(
+                                ev.data)
+                            if ev.stream_ended:
+                                self._dispatch(ev.stream_id)
+                        elif isinstance(ev, _H2_REQ_EVENT):
+                            self._heads[ev.stream_id] = list(ev.headers)
+                            if ev.stream_ended:
+                                self._dispatch(ev.stream_id)
+                        # SettingsAcknowledged / PingReceived / etc.: nothing to do
+            except ConnectionError:
+                return  # peer closed the connection
+            except H2Error as exc:
+                print(f"ralph web: h2 protocol error: {exc}", file=sys.stderr)
+                try:  # signal the peer, then drop the connection
+                    self.conn.close_connection()
+                    self.flush()
+                except Exception:
+                    pass
+
+    class _ThreadingTCPServer(socketserver.ThreadingTCPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+    class _DualRequestHandler:
+        """Per-connection handler for _ThreadingTCPServer.
+
+        Sniffs the first bytes: the h2 client preface (prior knowledge)
+        means cleartext HTTP/2, anything else falls back to the stdlib
+        HTTP/1.1 Handler unchanged.
+        """
+
+        def __init__(self, sock: socket.socket, addr: tuple,
+                     server: Any) -> None:
+            self.sock = sock
+            self.addr = addr
+            self.server = server
+            try:
+                head = b""
+                closed = False
+                while len(head) < len(_H2_PREFACE):
+                    chunk = sock.recv(len(_H2_PREFACE) - len(head))
+                    if not chunk:
+                        closed = True
+                        break
+                    head += chunk
+                if _H2 and (head == _H2_PREFACE
+                            or (closed and _H2_PREFACE.startswith(head))):
+                    _H2Session(sock, head, Handler.ctx).run()
+                else:
+                    self._http11(head)
+            finally:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+        def _http11(self, head: bytes) -> None:
+            # Bypass BaseHTTPRequestHandler.__init__/setup and wire the
+            # already-inspected leading bytes back into rfile.
+            h = Handler.__new__(Handler)
+            h.server = self.server
+            h.client_address = self.addr
+            h.connection = self.sock
+            h.request = self.sock
+            h.rfile = _HeadReader(head, self.sock.makefile("rb"))
+            h.wfile = self.sock.makefile("wb")
+            try:
+                h.handle()
+            except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                pass
+            except Exception as exc:
+                h.log_message("error while processing request: %s", exc)
+            finally:
+                try:
+                    h.wfile.close()
+                except (OSError, ValueError):
+                    pass
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def serve(host: str = "127.0.0.1", port: int = 8787,
-          db: Path | str | None = None, open_browser: bool = False) -> int:
+          db: Path | str | None = None, open_browser: bool = False,
+          http2: bool = True) -> int:
     ctx = ServerContext(db or default_db_path())
     Handler.ctx = ctx
-    httpd = ThreadingHTTPServer((host, port), Handler)
+    if http2 and _H2:
+        httpd: Any = _ThreadingTCPServer((host, port), _DualRequestHandler)
+        proto = "HTTP/2 (h2c) + HTTP/1.1"
+    else:
+        if http2:
+            print("ralph web: 'h2' is not installed; serving HTTP/1.1 only",
+                  file=sys.stderr)
+        httpd = ThreadingHTTPServer((host, port), Handler)
+        proto = "HTTP/1.1"
     url = f"http://{host}:{port}/"
-    print(f"ralph web: serving {url}  (db: {ctx.store.path})")
+    print(f"ralph web: serving {url}  [{proto}]  (db: {ctx.store.path})")
     print("ralph web: press Ctrl-C to stop")
     if open_browser:
         webbrowser.open(url)

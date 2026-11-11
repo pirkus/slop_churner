@@ -291,6 +291,11 @@ class Store:
                     self._upsert_task(run_id, t)
             elif name == "task_updated":
                 self._upsert_task(run_id, data)
+            elif name == "agent_output":
+                # Live-streamed agent stdout lines: only forwarded to SSE
+                # subscribers, deliberately not persisted (the final 'step'
+                # event carries the full output).
+                pass
             elif name == "step":
                 self._conn.execute(
                     "INSERT INTO steps (run_id, task_id, iteration, stage, ok, output, duration, created_at) "

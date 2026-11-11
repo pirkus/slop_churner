@@ -111,7 +111,15 @@ you can create runs, watch them progress live, and read every step's log:
 ralph web                          # http://127.0.0.1:8787
 ralph web --port 9000 --open       # different port, open a browser
 ralph web --db /path/to/ralph.db   # custom database location
+ralph web --no-http2               # HTTP/1.1 only
 ```
+
+The web server speaks both HTTP/1.1 and cleartext HTTP/2 (h2c, prior
+knowledge) on the same port: connections are sniffed on the HTTP/2 client
+preface. This uses the `h2` package (an optional dependency); if it is not
+installed, or `--no-http2` is given, the server serves HTTP/1.1 only. SSE
+works over both protocols. E.g.
+`curl --http2-prior-knowledge http://127.0.0.1:8787/api/health`.
 
 Features:
 

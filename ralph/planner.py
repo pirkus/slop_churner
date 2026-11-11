@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import prompts
+from . import events, prompts
 from .agent import run_agent
 from .config import Config
 from .errors import RalphError
@@ -69,8 +69,13 @@ def _build_planner_prompt(cfg: Config, request: str) -> str:
     )
 
 
-def plan(cfg: Config, request: str) -> Plan:
-    """Run the planner agent once and return a validated task list."""
+def plan(cfg: Config, request: str, sink: events.Sink | None = None) -> Plan:
+    """Run the planner agent once and return a validated task list.
+
+    If a ``sink`` is given, every streamed planner stdout line is emitted
+    as an ``agent_output`` event (live progress; not persisted).
+    """
+    emit = sink or events.noop
     prompt = _build_planner_prompt(cfg, request)
     result = run_agent(
         cfg,
@@ -78,6 +83,7 @@ def plan(cfg: Config, request: str) -> Plan:
         cwd=cfg.repo,
         timeout=cfg.agent_timeout,
         label="planning tasks",
+        on_output=lambda line: emit("agent_output", {"label": "planning", "line": line}),
     )
     # Hard infra failures (missing binary, timeout) are not retryable here.
     if result.returncode in (127, -1) or (not result.ok and not result.output.strip()):

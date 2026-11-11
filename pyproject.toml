@@ -9,7 +9,9 @@ description = "An autonomous implement -> test -> PR loop driven by a coding age
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-dependencies = []
+dependencies = [
+    "h2>=4.0",
+]
 
 [project.scripts]
 ralph = "ralph.cli:main"

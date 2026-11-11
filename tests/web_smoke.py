@@ -25,7 +25,10 @@ import tests.smoke as smoke  # reuse repo fixture + plan JSON  # noqa: E402
 from ralph import planner, runner  # noqa: E402
 from ralph.agent import AgentResult  # noqa: E402
 from ralph.config import Config  # noqa: E402
-from ralph.web import Handler, ServerContext  # noqa: E402
+from ralph.web import Handler, ServerContext, _H2  # noqa: E402
+
+if _H2:  # boot the dual h2c/HTTP1.1 server when h2 is available
+    from ralph.web import _DualRequestHandler, _ThreadingTCPServer  # noqa: E402
 
 
 def sh(cwd, *a):
@@ -45,6 +48,12 @@ class StubAgent:
 
     def __call__(self, cfg, prompt, *, cwd, tools=None, timeout=None, **kw):
         time.sleep(0.2)  # give the SSE client a window to observe a live event
+        # Simulate streaming agent output: emit a few lines while the
+        # "agent" is still running (i.e. before this call returns).
+        on_output = kw.get("on_output")
+        if on_output is not None:
+            for i in range(1, 4):
+                on_output(f"stub agent line {i}\n")
         if "planning stage" in prompt:
             return AgentResult(True, smoke.PLAN_JSON, 0, 0.2)
         app = cwd / "app.py"
@@ -105,11 +114,16 @@ def main() -> int:
     runner.run_agent = stub
     runner.run_tests = flaky_tests
 
-    # Boot the server in-process on a random port.
+    # Boot the server in-process on a random port. With h2 installed this is
+    # the dual-protocol (h2c + HTTP/1.1) server, so every HTTP/1.1 assertion
+    # below also exercises the preface sniffing + fallback path.
     db = tmp / "ralph.db"
     ctx = ServerContext(db)
     Handler.ctx = ctx
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    if _H2:
+        httpd = _ThreadingTCPServer(("127.0.0.1", 0), _DualRequestHandler)
+    else:
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     port = httpd.server_address[1]
     base = f"http://127.0.0.1:{port}"
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -132,6 +146,8 @@ def main() -> int:
         # acceptance gate UI
         "awaiting_acceptance", "diffReview", "Accept", "/diff",
         'doAction("accept")', 'doAction("discard")', "Reject",
+        # live agent output pane + SSE handler
+        "liveout", "live agent output", 'name === "agent_output"',
     ):
         assert needle in page, f"ui.html is missing {needle!r}"
 
@@ -204,8 +220,22 @@ def main() -> int:
             break
     conn.close()
     names = [e["name"] for e in seen]
-    for expected in ("planned", "task_updated", "step", "run_review", "closed"):
+    for expected in ("planned", "agent_output", "task_updated", "step",
+                     "run_review", "closed"):
         assert expected in names, f"missing {expected} in SSE stream: {names}"
+    # agent_output lines must be delivered WHILE the agent is still running:
+    # the first implement agent_output precedes the implement 'step' event
+    # (the step only fires once the agent call has returned).
+    ao_idx = [i for i, e in enumerate(seen)
+              if e["name"] == "agent_output" and e["data"].get("stage") == "implement"]
+    assert ao_idx, f"no implement agent_output in SSE stream: {names}"
+    step_idx = [i for i, e in enumerate(seen)
+                if e["name"] == "step" and e["data"].get("stage") == "implement"]
+    assert step_idx, f"no implement step in SSE stream: {names}"
+    assert ao_idx[0] < step_idx[0], \
+        f"agent_output ({ao_idx[0]}) must arrive before step ({step_idx[0]}): {names}"
+    ao = seen[ao_idx[0]]["data"]
+    assert ao["task_id"] == 1 and ao["line"].startswith("stub agent line"), ao
 
     # The run parks in awaiting_acceptance: work is staged, base untouched.
     run = wait_for(f"{base}/api/runs/{rid}", "status",
@@ -399,6 +429,15 @@ def main() -> int:
         raise AssertionError("expected 409")
     except urllib.error.HTTPError as e:
         assert e.code == 409
+
+    # -- cleartext HTTP/2 (h2c) on the same port ---------------------------------
+    # NOTE: must run before the run-count assertions below (SSE check creates
+    # a run row).
+    if _H2:
+        import tests.http2_smoke as h2smoke
+        h2smoke.h2_checks(ctx, port, db)
+    else:
+        print("\nh2 not installed; skipping HTTP/2 checks")
 
     # -- DB file actually on disk -------------------------------------------------
     assert db.exists()
