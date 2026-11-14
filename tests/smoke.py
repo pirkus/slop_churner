@@ -408,6 +408,34 @@ def main_pr() -> int:
     return 0
 
 
+def main_state_review() -> int:
+    """Status.REVIEW exists, is non-terminal, and Task round-trips it."""
+    from slop_churner.state import Status, Task, TERMINAL
+
+    assert Status.REVIEW.value == "review"
+    assert Status.REVIEW not in TERMINAL, "REVIEW is a non-terminal status"
+
+    t = Task(id=1, title="t", description="d", status=Status.REVIEW)
+    d = t.to_dict()
+    assert d["status"] == "review", d
+    t2 = Task.from_dict(d)
+    assert t2.status is Status.REVIEW
+    assert t2.title == t.title and t2.description == t.description
+    assert t2.iterations == 0 and t2.last_error is None
+
+    # Config: self_review defaults to True, can be turned off.
+    tmp = Path(tempfile.mkdtemp(prefix="slop-churner-state-"))
+    repo = tmp / "proj"
+    repo.mkdir()
+    make_repo(repo)
+    assert Config(repo=repo, base_branch="main", agent_cmd="pi").self_review is True
+    assert Config(repo=repo, base_branch="main", agent_cmd="pi",
+                  self_review=False).self_review is False
+
+    print("\nSMOKE TEST (state/review) PASSED")
+    return 0
+
+
 if __name__ == "__main__":
     raise SystemExit(main() or main_plan_supplied() or main_streaming()
-                      or main_pr())
+                      or main_pr() or main_state_review())

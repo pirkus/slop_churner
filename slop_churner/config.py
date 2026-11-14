@@ -18,6 +18,7 @@ class Config:
     test_cmd: str | None = None      # override; default comes from tasks.json / autodetect
     pr_check_cmd: str | None = None  # optional hook run before merge (e.g. CI checks)
     pr_enabled: bool = False         # open a PR/MR on the forge when the run finishes
+    self_review: bool = True         # enable the per-task self-review agent stage
     agent_timeout: int = 1800        # seconds per agent call
     test_timeout: int = 900          # seconds per test run
 
