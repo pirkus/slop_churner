@@ -133,6 +133,14 @@
   .tstep .top .who { margin-left: auto; color: var(--accent); font-family: var(--mono); text-transform: none; letter-spacing: 0; }
   .tstep pre { margin: 0; padding: 0 12px 10px; font: 12px/1.5 var(--mono); white-space: pre-wrap; word-break: break-word; max-height: 240px; overflow: auto; color: #b9c4d4; background: var(--bg); }
   .retryrow { display: flex; gap: 8px; padding: 0 14px 12px; }
+  .tlive { border: 1px solid var(--border); border-radius: 8px; background: var(--panel2); overflow: hidden; }
+  .tlive.live { border-color: var(--accent); }
+  body.live .tlive.live { animation: pulse 1.4s ease-in-out infinite; }
+  .tlive .top { display: flex; align-items: center; gap: 8px; padding: 7px 10px; color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+  .tlive .top .stage { font-weight: 600; }
+  .tlive.live .top { color: var(--accent); }
+  .tlive .top .who { margin-left: auto; color: var(--accent); font-family: var(--mono); text-transform: none; letter-spacing: 0; }
+  .tlive pre { margin: 0; padding: 10px 12px; border-top: 1px solid var(--border); font: 12px/1.5 var(--mono); white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow: auto; color: #b9c4d4; background: var(--bg); border-radius: 0 0 8px 8px; }
 
   /* diff review */
   .difftitle { font-weight: 600; margin-bottom: 6px; }
@@ -328,12 +336,30 @@ async function selectRun(id) {
   const data = await api("/api/runs/" + id);
   selectedStatus = data.status;
   renderRun(data);
-  // Rebuild the transcript from the persisted history (this is what makes
-  // the output survive a page reload), then stream new lines on top.
+  // Rebuild from the persisted history (this is what makes the output
+  // survive a page reload), then stream new lines on top.
   let steps = [];
   try { steps = (await api("/api/runs/" + id + "/transcript")).steps; }
   catch { /* no transcript yet (or server hiccup) */ }
-  renderTranscript(steps, !!data.running);
+  // Task output renders inside its task row; the transcript box only
+  // carries run-level (planning) output.
+  const topSteps = steps.filter((s) => !/^\d+:/.test(s.key));
+  renderTranscript(topSteps, data.status === "planning"
+    && topSteps.length > 0 && topSteps[topSteps.length - 1].key === "planning");
+  // A task that is mid-agent-stage has streamed output without a step card
+  // yet: rebuild its live block from the persisted transcript.
+  if (data.running) {
+    const byTask = {};
+    for (const s of steps) {
+      const m = /^(\d+):/.exec(s.key);
+      if (m) (byTask[m[1]] = byTask[m[1]] || []).push(s);
+    }
+    for (const t of (data.tasks || [])) {
+      if (t.status !== "implementing" && t.status !== "fixing") continue;
+      const arr = byTask[String(t.task_id)];
+      if (arr && arr.length) attachTaskLive(String(t.task_id), arr[arr.length - 1], true);
+    }
+  }
   if (data.running) {
     setLive(true);
     openSSE(id);
@@ -731,11 +757,67 @@ function taskRow(t) {
     desc.className = "taskdesc"; esc(desc, t.description);
     row.appendChild(desc);
   }
-  if (t.status === "failed" && t.last_error) {
-    const err = document.createElement("div");
-    err.className = "taskerr"; esc(err, t.last_error);
+  if (t.status === "failed" && t.last_error) ensureErrorBlock(row, t.task_id, t.last_error);
+
+  // Steps + live streaming area. Persisted step cards load lazily on first
+  // open; the live block (streaming agent output) lives here too, so a
+  // task's output is always shown inside its own row.
+  const steps = document.createElement("div");
+  steps.className = "steps";
+  steps.style.display = "none";
+  row.appendChild(steps);
+
+  let loaded = false;
+  let loadP = null;
+  const ensureSteps = () => {
+    if (loaded || loadP) return loadP;
+    loadP = (async () => {
+      try {
+        const { steps: st } = await api(`/api/runs/${selectedRun}/tasks/${t.task_id}`);
+        const liveEl = steps.querySelector(".tlive");
+        // Skip cards already appended by live 'step' events.
+        const have = new Set([...steps.querySelectorAll(".step[data-key]")]
+          .map((c) => c.dataset.key));
+        if (!st.length && !liveEl && !have.size) {
+          const e = document.createElement("div");
+          e.className = "nodetail";
+          e.textContent = "no steps yet";
+          steps.appendChild(e);
+        } else {
+          const frag = document.createDocumentFragment();
+          for (const s of st) {
+            if (have.has(s.iteration + ":" + s.stage)) continue;
+            frag.appendChild(stepCard(s));
+          }
+          if (liveEl) steps.insertBefore(frag, liveEl);  // live block stays last
+          else steps.appendChild(frag);
+        }
+        loaded = true;
+      } catch (e) { alert(e.message); loadP = null; }
+    })();
+    return loadP;
+  };
+  row._ensureSteps = ensureSteps;
+
+  head.onclick = () => {
+    row.classList.toggle("open");
+    const open = row.classList.contains("open");
+    steps.style.display = open ? "" : "none";
+    if (open) ensureSteps();
+  };
+  return row;
+}
+
+function ensureErrorBlock(row, tid, text) {
+  let err = row.querySelector(".taskerr");
+  let rr = row.querySelector(".retryrow");
+  if (!err) {
+    err = document.createElement("div");
+    err.className = "taskerr";
     row.appendChild(err);
-    const rr = document.createElement("div");
+  }
+  if (!rr) {
+    rr = document.createElement("div");
     rr.className = "retryrow";
     const b = document.createElement("button");
     b.className = "ghost"; b.textContent = "Retry task";
@@ -743,46 +825,145 @@ function taskRow(t) {
       ev.stopPropagation();
       b.disabled = true;
       try {
-        await api(`/api/runs/${selectedRun}/retry/${t.task_id}`, { method: "POST" });
+        await api(`/api/runs/${selectedRun}/retry/${tid}`, { method: "POST" });
         selectRun(selectedRun);
       } catch (e) { b.disabled = false; alert(e.message); }
     };
     rr.appendChild(b);
     row.appendChild(rr);
   }
+  esc(err, text);
+  return [err, rr];
+}
 
-  const steps = document.createElement("div");
-  steps.className = "steps";
-  steps.style.display = "none";
-  row.appendChild(steps);
+// ---- live streaming inside a task row -------------------------------------
 
-  let loaded = false;
-  head.onclick = async () => {
-    row.classList.toggle("open");
-    const open = row.classList.contains("open");
-    steps.style.display = open ? "" : "none";
-    if (open && !loaded) {
-      loaded = true;
-      steps.innerHTML = "";
-      try {
-        const { steps: st } = await api(`/api/runs/${selectedRun}/tasks/${t.task_id}`);
-        if (!st.length) {
-          const e = document.createElement("div");
-          e.className = "nodetail";
-          e.textContent = "no steps yet";
-          steps.appendChild(e);
-        } else {
-          for (const s of st) steps.appendChild(stepCard(s));
-        }
-      } catch (e) { alert(e.message); }
-    }
-  };
-  return row;
+function findTaskRow(tid) {
+  return document.querySelector(`.taskrow[data-tid="${tid}"]`);
+}
+
+function findLive(tid, key, label) {
+  const row = findTaskRow(tid);
+  if (!row) return null;
+  const box = row.querySelector(".steps");
+  if (!box) return null;
+  let el = box.querySelector(`.tlive[data-key="${CSS.escape(key)}"]`);
+  if (!el) {
+    el = document.createElement("div");
+    el.className = "tlive";
+    el.dataset.key = key;
+    const top = document.createElement("div");
+    top.className = "top";
+    const st = document.createElement("span");
+    st.className = "stage"; esc(st, label);
+    const who = document.createElement("span");
+    who.className = "who"; esc(who, "streaming…");
+    top.append(st, who);
+    const pre = document.createElement("pre");
+    el.append(top, pre);
+    box.appendChild(el);
+  }
+  return el;
+}
+
+// Stream one chunk of agent output into the owning task's row (auto-opening
+// it so the text is visible). Returns false if the row isn't in the DOM yet.
+async function appendTaskLine(tid, key, label, line) {
+  const row = findTaskRow(tid);
+  if (!row) return false;
+  if (!row.classList.contains("open")) {
+    row.classList.add("open");
+    row.querySelector(".steps").style.display = "";
+  }
+  if (row._ensureSteps) await row._ensureSteps();
+  const el = findLive(tid, key, label);
+  if (!el) return false;
+  const pre = el.querySelector("pre");
+  // pi --mode json streams text deltas (no trailing newline) as well as
+  // whole lines, so append verbatim rather than forcing a newline per chunk.
+  pre.textContent += line || "";
+  pre.scrollTop = pre.scrollHeight;
+  return true;
+}
+
+// Surgical in-place update of a task row (pill, iteration, error block) so
+// an open row and its live streaming block survive a status change.
+function updateTaskRow(row, d) {
+  const p = row.querySelector(".taskhead .pill");
+  if (p) {
+    p.className = "pill " + (d.status || "pending");
+    p.textContent = d.status || "pending";
+  }
+  const it = row.querySelector(".taskhead .iter");
+  if (it) it.textContent = d.iterations ? "iter " + d.iterations : "";
+  const ti = row.querySelector(".taskhead .title");
+  if (ti && d.title) ti.textContent = d.title;
+  const wantErr = d.status === "failed" && d.last_error;
+  if (wantErr) {
+    const tid = d.task_id != null ? d.task_id : d.id;  // SSE vs API payload
+    ensureErrorBlock(row, tid, d.last_error);
+  }
+  else {
+    const e = row.querySelector(".taskerr");
+    if (e) e.remove();
+    const r = row.querySelector(".retryrow");
+    if (r) r.remove();
+  }
+}
+
+// Finalize one stage: its full output replaces the live streaming block.
+async function addStepCard(d) {
+  if (selectedRun == null) return;
+  const row = findTaskRow(d.task_id);
+  const box = row && row.querySelector(".steps");
+  if (!box) return;
+  if (row._ensureSteps) await row._ensureSteps();
+  const nod = box.querySelector(".nodetail");
+  if (nod) nod.remove();
+  const liveEl = box.querySelector(`.tlive[data-key="${d.task_id}:${d.stage}"]`);
+  if (liveEl) liveEl.remove();
+  if (box.querySelector(`.step[data-key="${d.iteration}:${d.stage}"]`)) return;
+  box.appendChild(stepCard(d));
+  box.scrollTop = box.scrollHeight;
+}
+
+// Poll fallback: SSE 'task_updated' events can be lost (connection blip,
+// server hiccup); the 4s poll compares server task statuses against the
+// pills on screen and patches any drift, so a refresh is never required.
+function syncTaskRows(tasks) {
+  if (!tasks || !tasks.length) return;
+  if (tasks.some((t) => !findTaskRow(t.task_id))) {
+    selectRun(selectedRun).catch(() => {});
+    return;
+  }
+  let dirty = false;
+  for (const t of tasks) {
+    const row = findTaskRow(t.task_id);
+    const p = row && row.querySelector(".taskhead .pill");
+    if (!p || p.textContent !== (t.status || "pending")) dirty = true;
+  }
+  if (!dirty) return;
+  for (const t of tasks) {
+    const row = findTaskRow(t.task_id);
+    if (row) updateTaskRow(row, t);
+  }
+}
+
+// Re-attach a still-in-flight task output step to its row after a reload:
+// the streaming block is rebuilt from the persisted transcript.
+function attachTaskLive(tid, s, isLive) {
+  const row = findTaskRow(tid);
+  if (!row) return;
+  const el = findLive(tid, s.key, s.label);
+  if (!el) return;
+  el.querySelector("pre").textContent = s.text;
+  if (isLive) el.classList.add("live");
 }
 
 function stepCard(s) {
   const step = document.createElement("div");
   step.className = "step";
+  step.dataset.key = s.iteration + ":" + s.stage;
   const top = document.createElement("div");
   top.className = "steptop";
   const st = document.createElement("span");
@@ -821,14 +1002,23 @@ function openSSE(id) {
     try { msg = JSON.parse(ev.data); } catch { return; }
     const { name, data } = msg;
     if (name === "task_updated") {
+      // Patch the existing row in place (pill, iter, error block) instead of
+      // replacing it: a full replacement would wipe an open row's live
+      // streaming block and reset its open state.
       const row = document.querySelector(`.taskrow[data-tid="${data.id}"]`);
-      if (row && selectedRun === id) {
-        row.replaceWith(taskRow(data));
-      }
+      if (row && selectedRun === id) updateTaskRow(row, data);
     } else if (name === "agent_output") {
       if (selectedRun !== id) return;
-      const key = data.label || (data.task_id + ":" + data.stage);
-      const label = data.label || ("task " + data.task_id + " / " + data.stage);
+      // Task output streams inside the owning task's row; run-level (e.g.
+      // planning) output goes to the transcript box above the task list.
+      if (data.task_id != null) {
+        const key = data.label || (data.task_id + ":" + data.stage);
+        const label = data.label || data.stage;
+        appendTaskLine(data.task_id, key, label, data.line).catch(() => {});
+        return;
+      }
+      const key = data.label || "agent output";
+      const label = data.label || "agent output";
       const box = $("transcript");
       if (!box) return;
       if (key !== liveKey) {
@@ -860,18 +1050,16 @@ function openSSE(id) {
       // awaiting approval — re-render the detail as a plan review.
       if (selectedRun === id) selectRun(id).catch(() => {});
     } else if (name === "step") {
-      const row = document.querySelector(`.taskrow.open[data-tid="${data.task_id}"]`);
-      const box = row && row.querySelector(".steps");
-      if (box) {
-        const nod = box.querySelector(".nodetail");
-        if (nod) nod.remove();
-        box.appendChild(stepCard(data));
-        box.scrollTop = box.scrollHeight;
-      }
+      if (selectedRun === id) addStepCard(data).catch(() => {});
     } else if (name === "closed" || name === "error" || name === "run_finished") {
       setLive(false);
       liveKey = null;
       livePre = null;
+      document.querySelectorAll(".tlive.live").forEach((el) => {
+        el.classList.remove("live");
+        const w = el.querySelector(".who");
+        if (w) w.textContent = "";
+      });
       if (name === "closed" && es) es.close();
       selectRun(id).catch(() => {});
     }
@@ -989,6 +1177,10 @@ async function loadForgeStatus() {
     api("/api/runs/" + selectedRun)
       .then((d) => {
         if (d.status !== selectedStatus) return selectRun(selectedRun);
+        // Fallback for lost SSE 'task_updated' events: patch any pill that
+        // drifted from the server, so a page refresh is never needed.
+        // (Skipped while the plan review is up: no task rows are rendered.)
+        if (d.status !== "awaiting_approval") syncTaskRows(d.tasks);
       })
       .catch(() => {});
   }, 4000);
