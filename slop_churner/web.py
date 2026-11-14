@@ -126,6 +126,7 @@ def _build_cfg(params: dict[str, Any]) -> Config:
         max_tasks=_int("max_tasks", 8),
         budget=_int("budget", None),
         test_cmd=params.get("test_cmd") or None,
+        pr_enabled=bool(params.get("pr_enabled") or False),
         agent_timeout=_int("agent_timeout", 1800),
         test_timeout=_int("test_timeout", 900),
     )
@@ -379,7 +380,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             run_id = self.ctx.store.create_run(repo, prompt, {k: b.get(k) for k in (
                 "repo", "base", "agent", "model", "max_iterations", "max_tasks",
-                "budget", "test_cmd", "agent_timeout", "test_timeout",
+                "budget", "test_cmd", "pr_enabled", "agent_timeout", "test_timeout",
             )})
         except SlopChurnerError as exc:
             self._json(400, {"error": str(exc)})

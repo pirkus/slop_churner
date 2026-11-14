@@ -20,6 +20,7 @@ def _cfg(args: argparse.Namespace) -> Config:
         max_tasks=args.max_tasks,
         budget=args.budget,
         test_cmd=args.test_cmd,
+        pr_enabled=getattr(args, "pr", False),
         agent_timeout=args.agent_timeout,
         test_timeout=args.test_timeout,
     )
@@ -229,6 +230,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--force-plan", action="store_true", help="re-plan even if state exists")
     sp.add_argument("--yes", action="store_true",
                     help="auto-accept the staged changes at the end (no prompt)")
+    sp.add_argument("--pr", action="store_true", default=False,
+                    help="open a PR/MR on the forge when the run finishes")
     common(sp)
     sp.set_defaults(func=cmd_run)
 

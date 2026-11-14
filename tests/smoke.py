@@ -134,6 +134,17 @@ def main() -> int:
     assert "slop-churner/" not in branches, f"branches should be cleaned up:\n{branches}"
     assert state.run_branch is None, "state must clear run_branch after accept"
 
+    # pr_enabled: default is False; CLI --pr sets it; web params thread it through.
+    assert cfg.pr_enabled is False, "pr_enabled must default to False"
+    from slop_churner.cli import build_parser
+    args = build_parser().parse_args(["run", "x"])
+    assert args.pr is False, "--pr must default to False"
+    args = build_parser().parse_args(["run", "x", "--pr"])
+    assert args.pr is True, "--pr must be a store_true flag"
+    from slop_churner.web import _build_cfg
+    assert _build_cfg({"repo": repo, "base": "main"}).pr_enabled is False
+    assert _build_cfg({"repo": repo, "base": "main", "pr_enabled": True}).pr_enabled is True
+
     # Reject path on a fresh repo: staging work is discarded, base untouched.
     tmp2 = Path(tempfile.mkdtemp(prefix="slop-churner-smoke-reject-"))
     repo2 = tmp2 / "proj"
