@@ -335,5 +335,79 @@ def main_streaming() -> int:
     return 0
 
 
+def main_pr() -> int:
+    """cfg.pr_enabled wires forge.create_pr into the run-completion flow.
+
+    Covers: success (URL printed), failure (notice + pr_created event),
+    unexpected exception (run outcome unchanged), and pr disabled (no call).
+    """
+    from slop_churner import forge as forge_mod
+
+    stub = StubAgent()
+    calls: list[dict] = []
+    mode = {"next": "ok"}
+
+    def fake_create_pr(repo, base, head, title, body):
+        calls.append(dict(repo=repo, base=base, head=head, title=title, body=body))
+        m = mode["next"]
+        if m == "ok":
+            return forge_mod.PRResult(True, "https://example.com/pr/1", "created", "")
+        if m == "fail":
+            return forge_mod.PRResult(False, "", "", "no gh/glab CLI found on PATH")
+        raise RuntimeError("boom: unexpected forge failure")
+
+    forge_mod.create_pr = fake_create_pr
+
+    def one_case(expect_call: bool, expect_event: bool):
+        tmp = Path(tempfile.mkdtemp(prefix="slop-churner-smoke-pr-"))
+        repo = tmp / "proj"
+        repo.mkdir()
+        make_repo(repo)
+        cfg = Config(repo=repo, base_branch="main", agent_cmd="pi",
+                     max_iterations=3, test_cmd="true", pr_enabled=expect_call)
+        planner.run_agent = stub
+        runner.run_agent = stub
+        runner.run_tests = stub_tests
+        stub_tests.n = 1  # first test run red, second green
+        seen: list[tuple[str, dict]] = []
+        report = run(cfg, "add a subtract function",
+                     sink=lambda ev, payload: seen.append((ev, payload)))
+        assert report.all_done, "PR path must not change the run outcome"
+        pr_events = [p for n, p in seen if n == "pr_created"]
+        if expect_call:
+            assert len(pr_events) == (1 if expect_event else 0), \
+                f"expected {'a pr_created event' if expect_event else 'no event'}: {seen}"
+            c = calls[-1]
+            assert c["base"] == "main", c
+            assert c["head"] == "slop-churner/run", c
+            assert c["title"] == "slop-churner: add a subtract function", c
+            assert "1. Add a subtract function \u2014 done" in c["body"], c["body"]
+        else:
+            assert not calls, "forge.create_pr must not be called with --pr unset"
+            assert not pr_events, "no pr_created event when pr is disabled"
+        return pr_events[0] if pr_events else None
+
+    # 0) pr disabled (--pr unset): forge is not called, no pr_created event.
+    one_case(expect_call=False, expect_event=False)
+
+    # 1) Success: URL reported in the event payload.
+    mode["next"] = "ok"
+    ev = one_case(expect_call=True, expect_event=True)
+    assert ev == {"url": "https://example.com/pr/1", "ok": True, "error": None}, ev
+
+    # 2) Failure (e.g. no gh/glab CLI): notice + event, run still completes.
+    mode["next"] = "fail"
+    ev = one_case(expect_call=True, expect_event=True)
+    assert ev == {"url": "", "ok": False, "error": "no gh/glab CLI found on PATH"}, ev
+
+    # 3) Unexpected exception: swallowed, run outcome unchanged, no event.
+    mode["next"] = "raise"
+    one_case(expect_call=True, expect_event=False)
+
+    print("\nSMOKE TEST (pr) PASSED")
+    return 0
+
+
 if __name__ == "__main__":
-    raise SystemExit(main() or main_plan_supplied() or main_streaming())
+    raise SystemExit(main() or main_plan_supplied() or main_streaming()
+                      or main_pr())
