@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -25,6 +26,22 @@ def make_stub(bin_dir: Path, name: str, body: str) -> None:
 
 def set_bin(bin_dir: Path) -> None:
     os.environ["PATH"] = str(bin_dir)
+
+
+def make_repo(root: Path) -> None:
+    """Throwaway git repo to pass as the `repo` arg of create_pr."""
+    root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=str(root), check=True,
+                   capture_output=True)
+    subprocess.run(["git", "config", "user.email", "slop-churner@test"],
+                   cwd=str(root), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "slop-churner"],
+                   cwd=str(root), check=True, capture_output=True)
+    (root / "app.py").write_text("def add(a, b):\n    return a + b\n")
+    subprocess.run(["git", "add", "-A"], cwd=str(root), check=True,
+                   capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(root), check=True,
+                   capture_output=True)
 
 
 def clear_bin() -> None:
@@ -51,21 +68,24 @@ def test_gh_success(tmp: Path) -> None:
     repo = tmp / "repo_gh_ok"
     b.mkdir()
     make_stub(b, "gh", """
-if [ "$1" = "auth" ] && [ "$2" = "status" ]; then exit 0; fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  echo "Logged in to github.com account (token gho_testtoken123)"; exit 0; fi
 echo "Created pull request"
-echo "https://github.com/example/repo/pull/42"
+echo "https://github.com/x/y/pull/42"
 exit 0
 """)
+    make_repo(repo)
     set_bin(b)
     infos = forge.check_forge()
     gh = infos[0]
-    assert gh.available and gh.authenticated and gh.name == "gh"
+    assert gh.name == "gh" and gh.available and gh.authenticated
+    glab = infos[1]
+    assert glab.name == "glab" and not glab.available
 
-    repo.mkdir()
     r = forge.create_pr(repo, "main", "feature", "My title", "My body")
     assert r.ok, r.error
-    assert r.url == "https://github.com/example/repo/pull/42"
-    assert "https://github.com/example/repo/pull/42" in r.output
+    assert r.url == "https://github.com/x/y/pull/42"
+    assert "https://github.com/x/y/pull/42" in r.output
     assert r.error == ""
 
 
@@ -146,6 +166,7 @@ def main() -> None:
         for fn in (test_no_clis, test_gh_success, test_gh_failure_includes_tail,
                    test_glab_success, test_gh_preferred_over_glab, test_timeout_never_raises):
             fn(tmp)
+            os.environ["PATH"] = OLD_PATH  # restore so later tests find git etc.
             print(f"ok: {fn.__name__}")
     print("forge test: all tests passed")
 
