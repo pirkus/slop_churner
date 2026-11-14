@@ -87,9 +87,9 @@ def plan(cfg: Config, request: str, sink: events.Sink | None = None) -> Plan:
     )
     # Hard infra failures (missing binary, timeout) are not retryable here.
     if result.returncode in (127, -1) or (not result.ok and not result.output.strip()):
+        detail = (result.error or result.output or "no output").strip()
         raise SlopChurnerError(
-            f"planner agent could not run (rc={result.returncode}): "
-            f"{result.output.strip() or 'no output'}"
+            f"planner agent could not run (rc={result.returncode}): {detail}"
         )
     plan = _validate(_extract_json(result.output), cfg.max_tasks)
     return plan

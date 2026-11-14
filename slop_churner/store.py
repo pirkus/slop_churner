@@ -21,6 +21,14 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def transcript_label(key: str) -> str:
+    """Human label for a transcript step key ('1:implementing' -> 'task 1 / implementing')."""
+    if ":" in key:
+        tid, stage = key.split(":", 1)
+        return f"task {tid} / {stage}"
+    return key
+
+
 def default_db_path() -> Path:
     return Path(os.environ.get("SLOP_CHURNER_DB") or "~/.slop-churner/slop-churner.db").expanduser()
 
@@ -69,6 +77,16 @@ CREATE TABLE IF NOT EXISTS steps (
 );
 CREATE INDEX IF NOT EXISTS idx_steps_run ON steps (run_id, task_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_run ON tasks (run_id);
+CREATE TABLE IF NOT EXISTS transcript (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id  INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    -- Identifies the agent step a line belongs to: the step's label
+    -- (e.g. 'planning') or '<task_id>:<stage>'. Consecutive rows with the
+    -- same key are one transcript step.
+    key     TEXT NOT NULL,
+    line    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_transcript_run ON transcript(run_id);
 """
 
 
@@ -125,6 +143,38 @@ class Store:
                 (status, error, _now(), _now(), run_id),
             )
             self._conn.commit()
+
+    def append_transcript(self, run_id: int, key: str, line: str) -> None:
+        """Persist one live agent-output line (replayable after reload)."""
+        if not line:
+            return
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO transcript (run_id, key, line) VALUES (?, ?, ?)",
+                (run_id, key, line),
+            )
+            self._conn.commit()
+
+    def transcript(self, run_id: int) -> list[dict[str, Any]]:
+        """Replay a run's agent output as ordered steps.
+
+        Returns ``[{key, label, text}, ...]`` — consecutive lines from the
+        same step are joined into one entry.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT key, line FROM transcript WHERE run_id = ? ORDER BY id",
+                (run_id,),
+            ).fetchall()
+        steps: list[dict[str, Any]] = []
+        for r in rows:
+            key = r["key"]
+            if steps and steps[-1]["key"] == key:
+                steps[-1]["text"] += r["line"]
+            else:
+                steps.append({"key": key, "label": transcript_label(key),
+                              "text": r["line"]})
+        return steps
 
     def set_plan_test_cmd(self, run_id: int, test_cmd: str | None) -> None:
         """Store (or clear) the approved plan's test_cmd for a run."""
@@ -292,10 +342,17 @@ class Store:
             elif name == "task_updated":
                 self._upsert_task(run_id, data)
             elif name == "agent_output":
-                # Live-streamed agent stdout lines: only forwarded to SSE
-                # subscribers, deliberately not persisted (the final 'step'
-                # event carries the full output).
-                pass
+                # Live-streamed agent output: forwarded to SSE subscribers
+                # AND persisted so the transcript survives a page reload.
+                # (The 'step' event still carries the final per-stage output.)
+                key = (data.get("label")
+                       or f'{data.get("task_id", "")}:{data.get("stage", "")}')
+                line = data.get("line", "")
+                if line:
+                    self._conn.execute(
+                        "INSERT INTO transcript (run_id, key, line) VALUES (?, ?, ?)",
+                        (run_id, key, line),
+                    )
             elif name == "step":
                 self._conn.execute(
                     "INSERT INTO steps (run_id, task_id, iteration, stage, ok, output, duration, created_at) "

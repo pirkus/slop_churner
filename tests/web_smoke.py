@@ -146,8 +146,8 @@ def main() -> int:
         # acceptance gate UI
         "awaiting_acceptance", "diffReview", "Accept", "/diff",
         'doAction("accept")', 'doAction("discard")', "Reject",
-        # live agent output pane + SSE handler
-        "liveout", "live agent output", 'name === "agent_output"',
+        # transcript pane (persisted history + live streaming) + SSE handler
+        "transcript", "tstep", "/transcript", 'name === "agent_output"',
     ):
         assert needle in page, f"ui.html is missing {needle!r}"
 
@@ -236,6 +236,16 @@ def main() -> int:
         f"agent_output ({ao_idx[0]}) must arrive before step ({step_idx[0]}): {names}"
     ao = seen[ao_idx[0]]["data"]
     assert ao["task_id"] == 1 and ao["line"].startswith("stub agent line"), ao
+
+    # -- transcript: agent output is persisted and replayable (reload-safe) --
+    tr = api_call("GET", f"{base}/api/runs/{rid}/transcript")
+    tsteps = tr["steps"]
+    assert tsteps, "transcript must have steps"
+    assert tsteps[0]["key"] == "planning", tsteps[0]
+    assert "stub agent line 3" in tsteps[0]["text"], tsteps[0]
+    impl = [s for s in tsteps if s["key"] == "1:implement"]
+    assert impl and "stub agent line 1" in impl[0]["text"], tsteps
+    assert impl[0]["label"] == "task 1 / implement", impl
 
     # The run parks in awaiting_acceptance: work is staged, base untouched.
     run = wait_for(f"{base}/api/runs/{rid}", "status",

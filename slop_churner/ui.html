@@ -122,10 +122,13 @@
     max-height: 320px; overflow: auto; color: #b9c4d4; background: var(--bg); border-radius: 0 0 8px 8px;
   }
   .nodetail { color: var(--dim); font-size: 13px; padding: 8px 2px; }
-  .liveout { border: 1px solid var(--accent); border-radius: 10px; background: var(--panel); margin-bottom: 16px; overflow: hidden; }
-  .liveout .top { display: flex; align-items: center; gap: 8px; padding: 8px 12px; color: var(--accent); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
-  .liveout .top .who { margin-left: auto; color: var(--dim); font-family: var(--mono); text-transform: none; letter-spacing: 0; }
-  .liveout pre { margin: 0; padding: 0 12px 10px; font: 12px/1.5 var(--mono); white-space: pre-wrap; word-break: break-word; max-height: 240px; overflow: auto; color: #b9c4d4; background: var(--bg); }
+  .transcript { display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px; }
+  .tstep { border: 1px solid var(--border); border-radius: 10px; background: var(--panel); overflow: hidden; }
+  .tstep.live { border-color: var(--accent); }
+  .tstep .top { display: flex; align-items: center; gap: 8px; padding: 8px 12px; color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+  .tstep.live .top { color: var(--accent); }
+  .tstep .top .who { margin-left: auto; color: var(--accent); font-family: var(--mono); text-transform: none; letter-spacing: 0; }
+  .tstep pre { margin: 0; padding: 0 12px 10px; font: 12px/1.5 var(--mono); white-space: pre-wrap; word-break: break-word; max-height: 240px; overflow: auto; color: #b9c4d4; background: var(--bg); }
   .retryrow { display: flex; gap: 8px; padding: 0 14px 12px; }
 
   /* diff review */
@@ -232,7 +235,9 @@ let selectedRun = null;
 let selectedStatus = null;     // last observed status of the selected run
 let es = null;                 // active EventSource
 let live = false;              // is the selected run actively running?
-let liveAgentKey = null;       // identifies the agent step streaming into the live pane
+let liveKey = null;            // key of the transcript step currently streaming
+let livePre = null;            // <pre> of the step currently streaming
+let lastResync = 0;            // throttles SSE error resyncs
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
@@ -313,6 +318,12 @@ async function selectRun(id) {
   const data = await api("/api/runs/" + id);
   selectedStatus = data.status;
   renderRun(data);
+  // Rebuild the transcript from the persisted history (this is what makes
+  // the output survive a page reload), then stream new lines on top.
+  let steps = [];
+  try { steps = (await api("/api/runs/" + id + "/transcript")).steps; }
+  catch { /* no transcript yet (or server hiccup) */ }
+  renderTranscript(steps, !!data.running);
   if (data.running) {
     setLive(true);
     openSSE(id);
@@ -376,20 +387,12 @@ function renderRun(data) {
   }
   d.appendChild(head);
 
-  // live agent output (while a run is actively executing agents)
-  if (data.running) {
-    const lo = document.createElement("div");
-    lo.className = "liveout";
-    const top = document.createElement("div");
-    top.className = "top";
-    top.textContent = "live agent output";
-    const who = document.createElement("span");
-    who.className = "who"; esc(who, "waiting for output…");
-    top.appendChild(who);
-    const pre = document.createElement("pre");
-    lo.append(top, pre);
-    d.appendChild(lo);
-  }
+  // transcript: persisted agent-output history + the live streaming target
+  const tr = document.createElement("div");
+  tr.id = "transcript";
+  tr.className = "transcript";
+  tr.style.display = "none";  // shown by renderTranscript once it has steps
+  d.appendChild(tr);
 
   // tasks
   if (data.status === "awaiting_approval") {
@@ -408,12 +411,61 @@ function renderRun(data) {
       const e = document.createElement("div");
       e.className = "nodetail";
       e.textContent = data.status === "queued" || data.status === "planning"
-        ? "planning tasks… (logs appear once the planner returns)"
+        ? "planning tasks…"
         : "no tasks recorded";
       d.appendChild(e);
     }
     for (const t of data.tasks) d.appendChild(taskRow(t));
   }
+}
+
+function transcriptBlock(step, live) {
+  const el = document.createElement("div");
+  el.className = "tstep" + (live ? " live" : "");
+  const top = document.createElement("div");
+  top.className = "top";
+  top.textContent = step.label;
+  if (live) {
+    const who = document.createElement("span");
+    who.className = "who"; esc(who, "streaming…");
+    top.appendChild(who);
+  }
+  const pre = document.createElement("pre");
+  esc(pre, step.text);
+  el.append(top, pre);
+  return el;
+}
+
+function renderTranscript(steps, live) {
+  const box = $("transcript");
+  if (!box) return;
+  box.innerHTML = "";
+  for (const s of steps) box.appendChild(transcriptBlock(s, false));
+  if (live) {
+    if (steps.length) {
+      // The step streaming right now is the newest one in the history.
+      const last = box.lastElementChild;
+      last.classList.add("live");
+      const who = document.createElement("span");
+      who.className = "who"; esc(who, "streaming…");
+      last.querySelector(".top").appendChild(who);
+      liveKey = steps[steps.length - 1].key;
+      livePre = last.querySelector("pre");
+      livePre.scrollTop = livePre.scrollHeight;
+    } else {
+      // Running but nothing persisted yet: waiting placeholder. The first
+      // real step replaces it (see the agent_output handler).
+      const el = transcriptBlock({ key: "", label: "agent output", text: "" }, true);
+      box.appendChild(el);
+      liveKey = null;
+      livePre = el.querySelector("pre");
+      esc(livePre, "waiting for output…");
+    }
+  } else {
+    liveKey = null;
+    livePre = null;
+  }
+  box.style.display = box.children.length ? "" : "none";
 }
 
 // ---- diff review / accept / reject -----------------------------------------
@@ -763,33 +815,35 @@ function openSSE(id) {
       if (row && selectedRun === id) {
         row.replaceWith(taskRow(data));
       }
-      // A fresh agent step is about to start: clear the live pane so the
-      // next agent_output lines begin a clean transcript.
-      if ((data.status === "implementing" || data.status === "fixing")
-          && liveAgentKey !== null) {
-        liveAgentKey = null;
-        const pre = document.querySelector(".liveout pre");
-        if (pre) pre.textContent = "";
-      }
     } else if (name === "agent_output") {
       if (selectedRun !== id) return;
       const key = data.label || (data.task_id + ":" + data.stage);
-      const lo = document.querySelector(".liveout");
-      if (!lo) return;
-      if (key !== liveAgentKey) {
-        // New agent step: reset the pane (label for planning, task:stage
-        // for implement/fix) and show who is running.
-        liveAgentKey = key;
-        const who = lo.querySelector(".who");
-        if (who) who.textContent = data.label
-          ? data.label
-          : ("task " + data.task_id + " / " + data.stage);
+      const label = data.label || ("task " + data.task_id + " / " + data.stage);
+      const box = $("transcript");
+      if (!box) return;
+      if (key !== liveKey) {
+        // New agent step: end the previous block, start a fresh one.
+        const old = box.querySelector(".tstep.live");
+        if (old) {
+          const oPre = old.querySelector("pre");
+          if (oPre && !oPre.textContent.trim()) old.remove();  // placeholder
+          else {
+            old.classList.remove("live");
+            const w = old.querySelector(".who");
+            if (w) w.remove();
+          }
+        }
+        box.appendChild(transcriptBlock({ key, label, text: "" }, true));
+        box.style.display = "";
+        liveKey = key;
+        livePre = box.lastElementChild.querySelector("pre");
       }
-      const pre = lo.querySelector("pre");
-      if (pre) {
-        const ln = data.line || "";
-        pre.textContent += ln.endsWith("\n") ? ln : ln + "\n";
-        pre.scrollTop = pre.scrollHeight;
+      if (livePre) {
+        // Append the chunk verbatim: pi --mode json streams text deltas
+        // (no trailing newline) as well as whole lines, so we must not force
+        // a newline per chunk or the transcript fragments.
+        livePre.textContent += data.line || "";
+        livePre.scrollTop = livePre.scrollHeight;
       }
     } else if (name === "planned") {
       // Planner finished (or the plan was re-saved): the run is now
@@ -806,12 +860,22 @@ function openSSE(id) {
       }
     } else if (name === "closed" || name === "error" || name === "run_finished") {
       setLive(false);
-      liveAgentKey = null;
+      liveKey = null;
+      livePre = null;
       if (name === "closed" && es) es.close();
       selectRun(id).catch(() => {});
     }
   };
-  es.onerror = () => { /* EventSource retries automatically */ };
+  es.onerror = () => {
+    // The stream was dropped (reset, network blip, server restart). The
+    // transcript is persisted server-side, so resync from the DB and reopen;
+    // throttled so a flapping connection can't hammer the API.
+    const now = Date.now();
+    if (selectedRun === id && now - lastResync > 3000) {
+      lastResync = now;
+      selectRun(id).catch(() => {});
+    }
+  };
 }
 
 // ---- new run form ---------------------------------------------------------
@@ -866,12 +930,17 @@ $("newrun").addEventListener("submit", async (e) => {
   await loadRuns();
   setInterval(() => {
     loadRuns();
-    // Keep the detail in sync while the planner works, so the run flips
-    // from 'planning tasks…' to the plan review the moment it lands.
-    if (selectedRun && (selectedStatus === "queued" || selectedStatus === "planning"
-                        || selectedStatus === "running")) {
-      selectRun(selectedRun).catch(() => {});
-    }
+    // Keep the detail in sync while the run progresses, so it flips from
+    // 'planning tasks…' to the plan review the moment the plan lands.
+    // Only re-select on a STATUS change: re-rendering (and re-opening the
+    // EventSource) every tick would wipe the live transcript and reset
+    // the SSE stream on the server.
+    if (!selectedRun) return;
+    api("/api/runs/" + selectedRun)
+      .then((d) => {
+        if (d.status !== selectedStatus) return selectRun(selectedRun);
+      })
+      .catch(() => {});
   }, 4000);
 })();
 </script>

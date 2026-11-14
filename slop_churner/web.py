@@ -11,7 +11,12 @@ Stdlib http.server + sqlite3, plus the optional `h2` package for cleartext
 HTTP/2 (h2c, prior-knowledge on the same port). If `h2` is not installed the
 server transparently falls back to HTTP/1.1 only.
 
-    slop-churner web [--host 127.0.0.1] [--port 8787] [--db PATH] [--open] [--no-http2]
+With --tls-cert/--tls-key the same port serves HTTPS: the protocol is
+negotiated via ALPN ("h2" when available, "http/1.1" otherwise), which is
+what browsers (Chrome/Firefox) use for HTTP/2.
+
+    slop-churner web [--host 127.0.0.1] [--port 8787] [--db PATH] [--open]
+                     [--no-http2] [--tls-cert FILE --tls-key FILE]
 """
 from __future__ import annotations
 
@@ -20,6 +25,7 @@ import queue
 import re
 import socket
 import socketserver
+import ssl
 import sys
 import threading
 import webbrowser
@@ -135,8 +141,8 @@ def _planning_worker(ctx: "ServerContext", run_id: int, params: dict[str, Any]) 
     try:
         ctx.store.set_run_status(run_id, "planning")
         cfg = _build_cfg(params)
-        # Stream the planner's live output to the UI over SSE (agent_output
-        # is live-only; the store ignores it).
+        # Stream the planner's live output to the UI over SSE; each line is
+        # also persisted (transcript table) so it survives a page reload.
         sink = WebSink(ctx.store, ctx.hub, run_id)
         plan = planner.plan(cfg, params.get("prompt", ""), sink=sink)
         for t in plan.tasks:
@@ -316,6 +322,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._get_task(int(m.group(1)), int(m.group(2)))
             elif m := re.fullmatch(r"/api/runs/(\d+)/diff", path):
                 self._diff(int(m.group(1)))
+            elif m := re.fullmatch(r"/api/runs/(\d+)/transcript", path):
+                rid = int(m.group(1))
+                if self.ctx.store.get_run(rid) is None:
+                    self._json(404, {"error": "no such run"})
+                else:
+                    self._json(200, {"steps": self.ctx.store.transcript(rid)})
             elif m := re.fullmatch(r"/api/runs/(\d+)/events", path):
                 self._sse(int(m.group(1)))
             else:
@@ -762,16 +774,17 @@ if _H2:
                     "content-type": "text/event-stream",
                     "cache-control": "no-cache",
                 })
-                while True:
+                while self.stream_id not in self.session._dead:
                     try:
                         ev = q.get(timeout=15)
                         chunk = f"data: {json.dumps(ev)}\n\n".encode()
                     except queue.Empty:
                         chunk = b": ping\n\n"
                     self.session.send_data(self.stream_id, chunk)
-                    self.session.flush()  # deliver each event as it arrives
-            except Exception:  # client gone / stream reset: stop the stream
-                pass
+                    # (send_data drains h2's outbound queue itself)
+            except Exception as exc:  # client gone / stream reset: stop
+                print(f"slop-churner web: h2 SSE stream {self.stream_id} "
+                      f"ended: {exc}", file=sys.stderr)
             finally:
                 self.session.ctx.hub.unsubscribe(run_id, q)
 
@@ -781,6 +794,14 @@ if _H2:
         Handles SETTINGS, HEADERS, DATA, RST_STREAM and WINDOW_UPDATE;
         requests are mapped onto Handler's routing and responses are sent
         as HEADERS + DATA frames.
+
+        h2.connection.H2Connection is not thread-safe, and every stream is
+        served from its own worker thread (a long-lived stream such as SSE
+        must not block the connection's read loop or the other multiplexed
+        streams), so all ``self.conn`` access is serialized on
+        ``self._lock``. Outbound DATA waits on the peer's flow-control
+        window (``self._fc``), which the read loop refills as
+        WINDOW_UPDATE frames arrive.
         """
 
         def __init__(self, sock: socket.socket, head: bytes,
@@ -794,6 +815,10 @@ if _H2:
             self._recv_buf = head
             self._heads: dict[int, list[tuple[str, str]]] = {}
             self._bodies: dict[int, list[bytes]] = {}
+            self._lock = threading.Lock()          # guards self.conn (not thread-safe)
+            self._fc = threading.Condition(self._lock)  # flow-control waiters
+            self._dead: set[int] = set()           # streams reset/closed by peer
+            self._streams: set[int] = set()        # every stream dispatched
 
         # -- low-level io ----------------------------------------------------
 
@@ -806,8 +831,10 @@ if _H2:
                 raise ConnectionError("client closed the connection")
             return data
 
-        def flush(self) -> None:
-            out = self.conn.data_to_send()
+        def _drain(self) -> None:
+            """Send whatever h2 has queued in its outbound buffer."""
+            with self._lock:
+                out = self.conn.data_to_send()
             if out:
                 self.sock.sendall(out)
 
@@ -815,27 +842,63 @@ if _H2:
 
         def send_head(self, stream_id: int, status: int,
                       headers: dict[str, str]) -> None:
-            self.conn.send_headers(
-                stream_id,
-                [(":status", str(status))] + list(headers.items()),
-                end_stream=False)
-            self.flush()
+            with self._fc:
+                self.conn.send_headers(
+                    stream_id,
+                    [(":status", str(status))] + list(headers.items()),
+                    end_stream=False)
+            self._drain()
+
+        def _send_payload(self, stream_id: int, payload: bytes,
+                          end_stream: bool) -> None:
+            """Send ``payload`` as DATA frames within the peer's window.
+
+            Waits on ``self._fc`` (woken by WINDOW_UPDATE frames in
+            run()) until flow-control space is available, instead of
+            raising FlowControlError. Raises ConnectionError if the
+            stream was reset in the meantime. The final frame carries
+            END_STREAM when ``end_stream`` is set.
+            """
+            sent = 0
+            total = len(payload)
+            while sent < total:
+                with self._fc:
+                    if stream_id in self._dead:
+                        raise ConnectionError("stream reset by peer")
+                    try:
+                        window = self.conn.local_flow_control_window(stream_id)
+                    except H2Error as exc:  # closed/reset stream
+                        raise ConnectionError("stream closed") from exc
+                    n = min(self.conn.max_outbound_frame_size, window,
+                            total - sent)
+                    if n <= 0:
+                        self._fc.wait(timeout=1.0)  # WINDOW_UPDATE / reset
+                        continue
+                    self.conn.send_data(stream_id, payload[sent:sent + n],
+                                        end_stream=(end_stream
+                                                     and sent + n == total))
+                self._drain()
+                sent += n
 
         def send_data(self, stream_id: int, data: bytes) -> None:
-            self.conn.send_data(stream_id, data, end_stream=False)
-            self.flush()
+            # Streaming (SSE): never END_STREAM. h2 does not fragment for
+            # us: split to the peer's MAX_FRAME_SIZE (default 16384) and
+            # honor its flow-control window.
+            self._send_payload(stream_id, data, end_stream=False)
+
+        def flush(self) -> None:
+            self._drain()
 
         def _send_response(self, stream_id: int, h: _H2Handler) -> None:
-            self.conn.send_headers(
-                stream_id,
-                [(":status", str(h._status))] + h._resp_headers,
-                end_stream=not h._chunks)
-            self.flush()
-            for i, chunk in enumerate(h._chunks):
-                self.conn.send_data(
-                    stream_id, chunk,
-                    end_stream=(i == len(h._chunks) - 1))
-                self.flush()
+            body = b"".join(h._chunks)
+            with self._fc:
+                self.conn.send_headers(
+                    stream_id,
+                    [(":status", str(h._status))] + h._resp_headers,
+                    end_stream=not body)
+            self._drain()
+            if body:  # the final DATA frame carries END_STREAM
+                self._send_payload(stream_id, body, end_stream=True)
 
         # -- event handling ----------------------------------------------------
 
@@ -865,46 +928,66 @@ if _H2:
                 return  # SSE already handled the stream out-of-band
             try:
                 self._send_response(stream_id, h)
-            except H2Error as exc:  # peer reset the stream: drop it
+            except (H2Error, ConnectionError, OSError) as exc:
+                # peer reset the stream / connection dropped: drop it
                 print(f"slop-churner web: h2 stream {stream_id} dropped: {exc}",
                       file=sys.stderr)
 
         def run(self) -> None:
             try:
                 while True:
-                    events = self.conn.receive_data(self._recv(65536))
-                    self.flush()
-                    for ev in events:
-                        if isinstance(ev, h2.events.StreamReset):
-                            self._heads.pop(ev.stream_id, None)
-                            self._bodies.pop(ev.stream_id, None)
-                        elif isinstance(ev, h2.events.WindowUpdated):
-                            # A received WINDOW_UPDATE grows our send window;
-                            # h2 already applied it, nothing to answer.
-                            # (Returning window is done via
-                            # acknowledge_received_data after consuming DATA.)
-                            pass
-                        elif isinstance(ev, h2.events.DataReceived):
-                            self.conn.acknowledge_received_data(
-                                len(ev.data), ev.stream_id)
-                            self._bodies.setdefault(ev.stream_id, []).append(
-                                ev.data)
-                            if ev.stream_ended:
-                                self._dispatch(ev.stream_id)
-                        elif isinstance(ev, _H2_REQ_EVENT):
-                            self._heads[ev.stream_id] = list(ev.headers)
-                            if ev.stream_ended:
-                                self._dispatch(ev.stream_id)
-                        # SettingsAcknowledged / PingReceived / etc.: nothing to do
-            except ConnectionError:
-                return  # peer closed the connection
+                    data = self._recv(65536)  # blocking; no lock held
+                    dispatch: list[int] = []
+                    with self._fc:
+                        events = self.conn.receive_data(data)
+                        for ev in events:
+                            if isinstance(ev, h2.events.StreamReset):
+                                self._dead.add(ev.stream_id)
+                                self._heads.pop(ev.stream_id, None)
+                                self._bodies.pop(ev.stream_id, None)
+                            elif isinstance(ev, h2.events.DataReceived):
+                                self.conn.acknowledge_received_data(
+                                    len(ev.data), ev.stream_id)
+                                self._bodies.setdefault(
+                                    ev.stream_id, []).append(ev.data)
+                                if ev.stream_ended:
+                                    dispatch.append(ev.stream_id)
+                            elif isinstance(ev, _H2_REQ_EVENT):
+                                self._heads[ev.stream_id] = list(ev.headers)
+                                if ev.stream_ended:
+                                    dispatch.append(ev.stream_id)
+                            # SettingsAcknowledged / PingReceived / etc.
+                        self._fc.notify_all()  # WINDOW_UPDATE / resets: wake senders
+                    self._drain()
+                    for sid in dispatch:
+                        # Serve each stream on its own thread so a
+                        # long-lived stream (SSE) cannot block the
+                        # connection's read loop or starve the other
+                        # multiplexed streams.
+                        with self._fc:
+                            self._streams.add(sid)
+                        threading.Thread(target=self._dispatch, args=(sid,),
+                                         name="slop-churner-h2-stream",
+                                         daemon=True).start()
+            except (ConnectionError, OSError):
+                self._kill_streams()  # peer closed: wake blocked senders
+                return
             except H2Error as exc:
                 print(f"slop-churner web: h2 protocol error: {exc}", file=sys.stderr)
+                self._kill_streams()
                 try:  # signal the peer, then drop the connection
-                    self.conn.close_connection()
-                    self.flush()
+                    with self._fc:
+                        self.conn.close_connection()
+                    self._drain()
                 except Exception:
                     pass
+
+        def _kill_streams(self) -> None:
+            """Connection is over: fail every live stream and wake any
+            senders parked on the flow-control window so they exit."""
+            with self._fc:
+                self._dead.update(self._streams)
+                self._fc.notify_all()
 
     class _ThreadingTCPServer(socketserver.ThreadingTCPServer):
         daemon_threads = True
@@ -924,6 +1007,25 @@ if _H2:
             self.addr = addr
             self.server = server
             try:
+                ssl_ctx: ssl.SSLContext | None = getattr(server, "ssl_ctx", None)
+                if ssl_ctx is not None:
+                    # TLS: the handshake already picked the protocol via ALPN.
+                    sock = ssl_ctx.wrap_socket(sock, server_side=True)
+                    self.sock = sock
+                    if (sock.selected_alpn_protocol() or "") == "h2" and _H2:
+                        # RFC 7540: the client preface is required even when
+                        # the protocol was negotiated via ALPN; h2 expects it
+                        # as the first received data.
+                        head = b""
+                        while len(head) < len(_H2_PREFACE):
+                            chunk = sock.recv(len(_H2_PREFACE) - len(head))
+                            if not chunk:
+                                break
+                            head += chunk
+                        _H2Session(sock, head, Handler.ctx).run()
+                    else:
+                        self._http11(b"")
+                    return
                 head = b""
                 closed = False
                 while len(head) < len(_H2_PREFACE):
@@ -937,6 +1039,9 @@ if _H2:
                     _H2Session(sock, head, Handler.ctx).run()
                 else:
                     self._http11(head)
+            except ssl.SSLError as exc:
+                print(f"slop-churner web: TLS handshake failed: {exc}",
+                      file=sys.stderr)
             finally:
                 try:
                     sock.close()
@@ -970,21 +1075,46 @@ if _H2:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _make_tls_context(cert: Path, key: Path, offer_h2: bool) -> ssl.SSLContext:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(str(cert), str(key))
+    try:
+        ctx.set_alpn_protocols(["h2", "http/1.1"] if offer_h2 else ["http/1.1"])
+    except ssl.SSLError as exc:  # incl. NotSupportedError
+        raise SlopChurnerError(
+            f"TLS ALPN is unavailable in this OpenSSL build: {exc}") from exc
+    return ctx
+
+
 def serve(host: str = "127.0.0.1", port: int = 8787,
           db: Path | str | None = None, open_browser: bool = False,
-          http2: bool = True) -> int:
+          http2: bool = True,
+          tls_cert: Path | str | None = None,
+          tls_key: Path | str | None = None) -> int:
+    if bool(tls_cert) != bool(tls_key):
+        raise SlopChurnerError("--tls-cert and --tls-key must be given together")
+    ssl_ctx: ssl.SSLContext | None = None
+    if tls_cert is not None:
+        ssl_ctx = _make_tls_context(Path(tls_cert), Path(tls_key),
+                                    offer_h2=http2 and _H2)
     ctx = ServerContext(db or default_db_path())
     Handler.ctx = ctx
-    if http2 and _H2:
+    if (http2 and _H2) or ssl_ctx is not None:
         httpd: Any = _ThreadingTCPServer((host, port), _DualRequestHandler)
-        proto = "HTTP/2 (h2c) + HTTP/1.1"
+        if ssl_ctx is not None:
+            proto = ("HTTP/2 (ALPN h2) + HTTP/1.1 over TLS"
+                     if http2 and _H2 else "HTTP/1.1 over TLS")
+        else:
+            proto = "HTTP/2 (h2c) + HTTP/1.1"
     else:
         if http2:
             print("slop-churner web: 'h2' is not installed; serving HTTP/1.1 only",
                   file=sys.stderr)
         httpd = ThreadingHTTPServer((host, port), Handler)
         proto = "HTTP/1.1"
-    url = f"http://{host}:{port}/"
+    httpd.ssl_ctx = ssl_ctx
+    scheme = "https" if ssl_ctx is not None else "http"
+    url = f"{scheme}://{host}:{port}/"
     print(f"slop-churner web: serving {url}  [{proto}]  (db: {ctx.store.path})")
     print("slop-churner web: press Ctrl-C to stop")
     if open_browser:

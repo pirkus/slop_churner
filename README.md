@@ -115,6 +115,7 @@ slop-churner web                          # http://127.0.0.1:8787
 slop-churner web --port 9000 --open       # different port, open a browser
 slop-churner web --db /path/to/slop-churner.db   # custom database location
 slop-churner web --no-http2               # HTTP/1.1 only
+slop-churner web --tls-cert cert.pem --tls-key key.pem   # https:// with ALPN h2/http1.1
 ```
 
 The web server speaks both HTTP/1.1 and cleartext HTTP/2 (h2c, prior
@@ -123,6 +124,12 @@ preface. This uses the `h2` package (an optional dependency); if it is not
 installed, or `--no-http2` is given, the server serves HTTP/1.1 only. SSE
 works over both protocols. E.g.
 `curl --http2-prior-knowledge http://127.0.0.1:8787/api/health`.
+
+Browsers (Chrome, Firefox) never use cleartext h2c — they only negotiate
+HTTP/2 via ALPN over TLS. With `--tls-cert`/`--tls-key` (PEM cert + key,
+e.g. from `mkcert` or a self-signed cert) the same port serves `https://`
+and advertises `h2` + `http/1.1` via ALPN, so DevTools' network panel will
+show `h2`. The h2c path above still works for server-to-server and curl.
 
 Features:
 

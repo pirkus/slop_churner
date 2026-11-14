@@ -178,6 +178,8 @@ def cmd_web(args: argparse.Namespace) -> int:
         db=args.db,
         open_browser=args.open,
         http2=not args.no_http2,
+        tls_cert=args.tls_cert,
+        tls_key=args.tls_key,
     )
 
 
@@ -267,6 +269,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--open", action="store_true", help="open a browser window")
     sp.add_argument("--no-http2", action="store_true",
                     help="serve HTTP/1.1 only (disable cleartext HTTP/2/h2c)")
+    sp.add_argument("--tls-cert", default=None,
+                    help="TLS certificate (PEM); serves https:// with ALPN h2/http1.1")
+    sp.add_argument("--tls-key", default=None,
+                    help="TLS private key (PEM); use together with --tls-cert")
     sp.set_defaults(func=cmd_web)
 
     return p

@@ -79,7 +79,11 @@ class H2Client:
         self.sock.sendall(self.conn.data_to_send())
         return self._read_response()
 
-    def _read_response(self) -> tuple[int, dict, bytes]:
+    def _read_response(self, sid: int | None = None) -> tuple[int, dict, bytes]:
+        """Read one response; frames of other (interleaved) streams are fed
+        to the h2 state machine but ignored."""
+        if sid is None:
+            sid = self._stream - 2
         status = None
         headers: dict[str, str] = {}
         chunks: list[bytes] = []
@@ -91,6 +95,8 @@ class H2Client:
             self.sock.sendall(self.conn.data_to_send())
             ended = False
             for ev in events:
+                if getattr(ev, "stream_id", None) != sid:
+                    continue
                 if isinstance(ev, h2.events.DataReceived):
                     self.conn.acknowledge_received_data(len(ev.data), ev.stream_id)
                     chunks.append(ev.data)
@@ -137,19 +143,148 @@ def sse_check(ctx: ServerContext, port: int) -> None:
         if not data:
             raise AssertionError("server closed the SSE stream")
         events = cl.conn.receive_data(data)
-        s.sendall(cl.conn.data_to_send())
         for ev in events:
             if isinstance(ev, h2.events.DataReceived):
                 cl.conn.acknowledge_received_data(len(ev.data), ev.stream_id)
                 buf += ev.data
-                if b"sse_h2" in buf:
-                    s.close()
-                    ctx.store._conn.execute(
-                        "DELETE FROM runs WHERE id = ?", (run_id,))
-                    ctx.store._conn.commit()
-                    return
-        # saw only pings so far; keep waiting for a real event
-    raise AssertionError(f"no SSE event delivered over h2c; got: {buf!r}")
+        # Flush AFTER acknowledging: the acks generate the WINDOW_UPDATE
+        # frames the server needs before it can stream more data.
+        s.sendall(cl.conn.data_to_send())
+        # Require several distinct events: a single event would pass even if
+        # the (mis)server set END_STREAM on the first frame and the stream
+        # died — which is exactly the regression this guards.
+        if buf.count(b"sse_h2") >= 3:
+            s.close()
+            ctx.store._conn.execute(
+                "DELETE FROM runs WHERE id = ?", (run_id,))
+            ctx.store._conn.commit()
+            return
+        # not enough events yet; keep waiting
+    raise AssertionError(f"fewer than 3 SSE events over h2c; got: {buf!r}")
+
+
+def _open_sse_stream(cl: H2Client, run_id: int) -> int:
+    """Open a run's SSE stream on a fresh client stream; return the id."""
+    sid = cl._stream
+    cl._stream += 2
+    peer = cl.sock.getpeername()
+    cl.conn.send_headers(sid, [
+        (":method", "GET"), (":scheme", "http"),
+        (":path", f"/api/runs/{run_id}/events"),
+        (":authority", f"{peer[0]}:{peer[1]}"),
+    ], end_stream=True)
+    cl.sock.sendall(cl.conn.data_to_send())
+    return sid
+
+
+def _pump_stream(cl: H2Client, sid: int, until: bytes,
+                 seconds: float) -> bytes:
+    """Read from the socket, collecting stream ``sid``'s DATA frames.
+
+    Frames of other (interleaved) streams are still fed to the h2 state
+    machine and acknowledged, but discarded. Returns sid's payload once it
+    contains ``until``; raises on timeout.
+    """
+    buf = b""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        try:
+            data = cl.sock.recv(65536)
+        except socket.timeout:
+            continue
+        if not data:
+            raise AssertionError("server closed the connection mid-stream")
+        events = cl.conn.receive_data(data)
+        for ev in events:
+            if isinstance(ev, h2.events.DataReceived):
+                cl.conn.acknowledge_received_data(len(ev.data), ev.stream_id)
+                if ev.stream_id == sid:
+                    buf += ev.data
+                    if until in buf:
+                        return buf
+        # Acknowledge first, then flush: the acks are what generate the
+        # WINDOW_UPDATE frames the server needs to keep streaming.
+        cl.sock.sendall(cl.conn.data_to_send())
+    raise AssertionError(f"stream {sid} did not deliver {until!r} in {seconds}s; "
+                         f"got {len(buf)} bytes: {buf[:120]!r}")
+
+
+def multiplex_check(ctx: ServerContext, port: int) -> None:
+    """A live SSE stream must not starve the other streams of the same h2
+    connection.
+
+    Regression test: _H2Session used to serve streams inline in its read
+    loop, so the moment EventSource opened, the loop blocked forever in
+    the SSE pump and every other request on the connection (browser UI
+    polling, page reloads, approve/reject) hung — 'UI freezes during the
+    planning phase'.
+    """
+    run_id = ctx.store.create_run("/tmp", "h2 multiplex", {})
+    s = socket.create_connection(("127.0.0.1", port), timeout=10)
+    cl = H2Client(s)
+    try:
+        sse_sid = _open_sse_stream(cl, run_id)
+
+        # Regular request on a second stream while the SSE stream is live:
+        # it must be answered, not queue behind the SSE pump.
+        status, headers, body = cl.request("GET", "/api/health")
+        assert status == 200, (status, headers, body)
+        assert json.loads(body)["ok"] is True, body
+
+        # ...and the SSE stream must still deliver events (publish in a
+        # background loop: the server subscribes only once its stream thread
+        # starts, so a one-shot publish can race ahead of it).
+        stop = threading.Event()
+        def publish_loop():
+            while not stop.wait(0.1):
+                ctx.hub.publish(run_id, {"name": "mx", "data": {"n": 1}})
+        pt = threading.Thread(target=publish_loop, daemon=True)
+        pt.start()
+        try:
+            buf = _pump_stream(cl, sse_sid, b'"mx"', seconds=10)
+        finally:
+            stop.set()
+        assert b"mx" in buf, buf
+    finally:
+        s.close()
+        with ctx.store._lock:
+            ctx.store._conn.execute("DELETE FROM runs WHERE id = ?", (run_id,))
+            ctx.store._conn.commit()
+
+
+def big_sse_check(ctx: ServerContext, port: int) -> None:
+    """A single SSE event far larger than the 64 KiB initial flow-control
+    window must stream through intact.
+
+    Regression test: send_data used to ignore the peer's window and h2
+    raised FlowControlError past ~64 KiB, which the SSE handler swallowed
+    and silently killed the live stream mid-planning.
+    """
+    run_id = ctx.store.create_run("/tmp", "h2 big sse", {})
+    s = socket.create_connection(("127.0.0.1", port), timeout=10)
+    cl = H2Client(s)
+    try:
+        sse_sid = _open_sse_stream(cl, run_id)
+        event = {"name": "big", "data": {"blob": "x" * 300_000}}
+        expected = ("data: " + json.dumps(event) + "\n\n").encode()
+        stop = threading.Event()
+        def publish_loop():
+            # Publish repeatedly: the server subscribes only once its stream
+            # thread starts, and the client consumes each copy as it arrives.
+            while not stop.wait(0.1):
+                ctx.hub.publish(run_id, event)
+        pt = threading.Thread(target=publish_loop, daemon=True)
+        pt.start()
+        try:
+            buf = _pump_stream(cl, sse_sid, expected, seconds=20)
+            assert expected in buf
+        finally:
+            stop.set()
+    finally:
+        s.close()
+        with ctx.store._lock:
+            ctx.store._conn.execute("DELETE FROM runs WHERE id = ?", (run_id,))
+            ctx.store._conn.commit()
 
 
 def h2_checks(ctx: ServerContext, port: int, db: Path) -> None:
@@ -185,6 +320,12 @@ def h2_checks(ctx: ServerContext, port: int, db: Path) -> None:
     # -- SSE events stream as DATA frames over h2c ------------------------------
     sse_check(ctx, port)
     s.close()
+
+    # -- a live SSE stream must not starve the rest of the connection ----------
+    multiplex_check(ctx, port)
+
+    # -- >64 KiB SSE events cross the flow-control window intact ----------------
+    big_sse_check(ctx, port)
 
 
 def main() -> int:

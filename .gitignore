@@ -11,6 +11,11 @@ dist/
 *-slop-churner/
 slop-churner.db
 
+# TLS material for the web UI (--tls-cert / --tls-key)
+*.pem
+*.key
+*.crt
+
 # Editors / OS
 .vscode/
 .idea/
