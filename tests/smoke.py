@@ -58,6 +58,8 @@ class StubAgent:
         self.calls += 1
         if "planning stage" in prompt:
             return AgentResult(True, PLAN_JSON, 0, 0.1)
+        if "self-review stage" in prompt:
+            return AgentResult(True, "APPROVE\n- looks complete", 0, 0.1)
         # implement / fix
         app = cwd / "app.py"
         if "subtract" not in app.read_text():
@@ -217,6 +219,8 @@ def main_plan_supplied() -> int:
                 raise AssertionError(
                     "planner agent must not be invoked with a pre-supplied plan"
                 )
+            if "self-review stage" in prompt:
+                return AgentResult(True, "APPROVE\n- looks complete", 0, 0.1)
             app = cwd / "app.py"
             src = app.read_text()
             if "subtract" not in src:
@@ -414,10 +418,13 @@ class ReviewStub:
     def __init__(self, verdicts):
         self.verdicts = list(verdicts)
         self.review_calls = 0
+        self.fix_prompts: list[str] = []
 
     def __call__(self, cfg, prompt, *, cwd, tools=None, timeout=None, **kw):
         if "planning stage" in prompt:
             return AgentResult(True, PLAN_JSON, 0, 0.1)
+        if "fix stage" in prompt:
+            self.fix_prompts.append(prompt)
         if "self-review stage" in prompt:
             self.review_calls += 1
             v = self.verdicts[min(self.review_calls - 1, len(self.verdicts) - 1)]
@@ -476,6 +483,17 @@ def main_review() -> int:
     assert stub.review_calls == 2, stub.review_calls
     stages = [p["stage"] for n, p in seen if n == "step"]
     assert stages[:6] == ["implement", "test", "review", "fix", "test", "review"], stages
+    # The fix loop was really invoked, citing the failed review stage.
+    assert any("PROBLEM: review" in p for p in stub.fix_prompts), stub.fix_prompts
+
+    # Change still staged on the run branch after the review-driven fix.
+    branches = subprocess.run(["git", "branch"], cwd=str(cfg.repo),
+                              capture_output=True, text=True).stdout
+    assert "slop-churner/run" in branches, branches
+    sh(cfg.repo, "git", "checkout", "slop-churner/run")
+    assert "def subtract" in (cfg.repo / "app.py").read_text(), \
+        "subtract should be staged on the run branch"
+    sh(cfg.repo, "git", "checkout", "main")
 
     # 3) self_review=False: no review agent call, no review log.
     cfg, stub, seen, report = one_case(["REJECT: should never be asked"],
