@@ -60,6 +60,9 @@
   .startrow { display: flex; gap: 8px; margin-top: 12px; }
   .startrow button { flex: 1; }
   .formerr { color: var(--red); font-size: 12px; margin-top: 8px; white-space: pre-wrap; min-height: 14px; }
+  .formwarn { color: var(--amber); font-size: 12px; margin-top: 8px; white-space: pre-wrap; min-height: 14px; }
+  .formhint { color: var(--dim); font-size: 11px; margin-top: 4px; }
+  label.checklabel { display: flex; align-items: center; gap: 6px; cursor: pointer; }
 
   .runlist { margin-top: 22px; display: flex; flex-direction: column; gap: 8px; }
   .runitem {
@@ -202,6 +205,13 @@
           <div>
             <label for="f-budget">budget</label>
             <input type="number" id="f-budget" placeholder="∞" min="1">
+          </div>
+          <div>
+            <label for="f-pr" class="checklabel">
+              <input type="checkbox" id="f-pr">
+              open a PR/MR when the run finishes
+            </label>
+            <div class="formhint" id="f-pr-hint"></div>
           </div>
           <div>
             <label for="f-atimeout">agent timeout (s)</label>
@@ -883,6 +893,7 @@ function openSSE(id) {
 $("newrun").addEventListener("submit", async (e) => {
   e.preventDefault();
   const errEl = $("f-err");
+  errEl.className = "formerr";
   errEl.textContent = "";
   const val = (id, num) => {
     const v = $(id).value.trim();
@@ -899,6 +910,7 @@ $("newrun").addEventListener("submit", async (e) => {
     max_iterations: val("f-iter", true),
     max_tasks: val("f-tasks", true),
     budget: val("f-budget", true),
+    pr_enabled: $("f-pr").checked,
     agent_timeout: val("f-atimeout", true),
     test_timeout: val("f-ttimeout", true),
   };
@@ -906,19 +918,56 @@ $("newrun").addEventListener("submit", async (e) => {
   const btn = $("f-start");
   btn.disabled = true;
   try {
-    const { run_id } = await api("/api/runs", {
+    const res = await api("/api/runs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
     $("f-prompt").value = "";
-    await selectRun(run_id);
+    // The server accepts the run but may flag soft problems (e.g. the forge
+    // CLI is present but not authenticated) — surface them, don't hide them.
+    if (Array.isArray(res.warnings) && res.warnings.length) {
+      errEl.className = "formwarn";
+      errEl.textContent = res.warnings.join("\n");
+    }
+    await selectRun(res.run_id);
   } catch (err) {
+    errEl.className = "formerr";
     errEl.textContent = err.message;
   } finally {
     btn.disabled = false;
   }
 });
+
+// PR/MR availability: ask the server whether gh/glab exist and are
+// authenticated, then enable/disable the checkbox and show a hint or warning.
+async function loadForgeStatus() {
+  const box = $("f-pr");
+  const hint = $("f-pr-hint");
+  let forges = null;
+  try { forges = (await api("/api/forge")).forges; }
+  catch { forges = null; }  // /api/forge missing or server hiccup
+  if (!Array.isArray(forges) || !forges.some((f) => f.available)) {
+    box.disabled = true;
+    box.checked = false;
+    hint.className = "formhint";
+    hint.textContent = "no gh/glab on PATH — PR opening unavailable";
+    return;
+  }
+  box.disabled = false;
+  const avail = forges.filter((f) => f.available);
+  if (!avail.some((f) => f.authenticated)) {
+    const cli = avail[0].name;
+    const tip = cli === "gh" ? "gh auth login or set GITHUB_TOKEN"
+      : cli === "glab" ? "glab auth login or set GITLAB_TOKEN"
+      : `${cli} auth login`;
+    hint.className = "formhint formwarn";
+    hint.textContent = `${cli} found but no token detected (auth status failed) — the PR step will probably fail; run ${tip}`;
+  } else {
+    hint.className = "formhint";
+    hint.textContent = "";
+  }
+}
 
 // ---- boot ------------------------------------------------------------------
 
@@ -927,6 +976,7 @@ $("newrun").addEventListener("submit", async (e) => {
     const h = await api("/api/health");
     $("dbpath").textContent = h.db;
   } catch {}
+  await loadForgeStatus();
   await loadRuns();
   setInterval(() => {
     loadRuns();
