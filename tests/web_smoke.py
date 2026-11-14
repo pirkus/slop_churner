@@ -161,6 +161,8 @@ def main() -> int:
     })
     rid = r1["run_id"]
     assert rid >= 1
+    # No pr_enabled -> the 201 body is exactly {"run_id": ...} (no warnings).
+    assert set(r1.keys()) == {"run_id"}, r1
     run = wait_for(f"{base}/api/runs/{rid}", "status", {"awaiting_approval", "error"})
     assert run["status"] == "awaiting_approval", run
     assert len(run["tasks"]) == 1
@@ -362,6 +364,63 @@ def main() -> int:
     except urllib.error.HTTPError as e:
         assert e.code == 400
 
+    # -- forge: /api/forge endpoint + server-side pr_enabled guard ------------
+    from slop_churner import forge as forge_mod
+    from slop_churner.forge import ForgeInfo
+    real_check = forge_mod.check_forge
+    try:
+        # GET /api/forge returns the gh/glab status list (one entry per CLI).
+        forge_mod.check_forge = lambda: [
+            ForgeInfo(name="gh", available=True, authenticated=True, detail="ok"),
+            ForgeInfo(name="glab", available=False, authenticated=False,
+                      detail="not on PATH"),
+        ]
+        fg = api_call("GET", f"{base}/api/forge")
+        assert [f["name"] for f in fg["forges"]] == ["gh", "glab"], fg
+        assert fg["forges"][0] == {"name": "gh", "available": True,
+                                  "authenticated": True, "detail": "ok"}, fg
+        assert fg["forges"][1]["available"] is False, fg
+        assert all(set(f) == {"name", "available", "authenticated", "detail"}
+                   for f in fg["forges"]), fg
+
+        # pr_enabled with no CLI on the machine -> 400, and no run is created.
+        forge_mod.check_forge = lambda: [
+            ForgeInfo(name="gh", available=False, authenticated=False,
+                      detail="not on PATH"),
+            ForgeInfo(name="glab", available=False, authenticated=False,
+                      detail="not on PATH"),
+        ]
+        try:
+            api_call("POST", f"{base}/api/runs",
+                     {"prompt": "x", "repo": str(repo), "pr_enabled": True})
+            raise AssertionError("expected 400 for pr_enabled with no CLI")
+        except urllib.error.HTTPError as e:
+            assert e.code == 400, e.code
+            assert json.loads(e.read().decode()) == {
+                "error": "pr_enabled but no gh/glab CLI found on the server"}
+
+        # pr_enabled with a CLI present but unauthenticated -> 201 + warnings
+        # naming the first available CLI.
+        forge_mod.check_forge = lambda: [
+            ForgeInfo(name="gh", available=True, authenticated=False,
+                      detail="gh auth status failed (no token?)"),
+            ForgeInfo(name="glab", available=False, authenticated=False,
+                      detail="not on PATH"),
+        ]
+        rfg = api_call("POST", f"{base}/api/runs", {
+            "prompt": "add a subtract function", "repo": str(repo),
+            "base": "main", "test_cmd": "true", "pr_enabled": True})
+        assert "run_id" in rfg and rfg.get("warnings"), rfg
+        assert any("gh not authenticated" in w for w in rfg["warnings"]), rfg
+        ridfg = rfg["run_id"]
+        runfg = wait_for(f"{base}/api/runs/{ridfg}", "status",
+                         {"awaiting_approval", "error"})
+        assert runfg["status"] == "awaiting_approval", runfg
+        api_call("POST", f"{base}/api/runs/{ridfg}/reject")
+        assert api_call("GET", f"{base}/api/runs/{ridfg}")["status"] == "cancelled"
+    finally:
+        forge_mod.check_forge = real_check
+
     # -- run 2: failing task -> approve -> fail -> retry ------------------------
     stub.fail_always = True
     r2 = api_call("POST", f"{base}/api/runs", {
@@ -453,7 +512,7 @@ def main() -> int:
     assert db.exists()
     import sqlite3
     conn = sqlite3.connect(str(db))
-    assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 4
+    assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 5
     assert conn.execute("SELECT COUNT(*) FROM steps").fetchone()[0] >= 11
     conn.close()
 
