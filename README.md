@@ -103,6 +103,7 @@ slop-churner web                     # serve the web dashboard + API (see below)
 slop-churner accept                  # merge the staged run into the base branch
 slop-churner reject                  # discard the staged run (branch + worktrees)
 slop-churner run "PROMPT" --yes      # auto-accept at the end (no prompt)
+slop-churner run "PROMPT" --pr       # also open a real PR/MR when the run finishes
 ```
 
 ## Web UI
@@ -219,9 +220,49 @@ enough; no remote required. Two-level model:
    **reject** deletes the staging branch and worktrees. Base is modified only
    by an explicit accept.
 
-If you want a *real* PR/CI gate (e.g. GitHub Actions), the cleanest extension
-is to point the push in step 1 at a real remote and merge on green — the
-staging branch is exactly the PR branch.
+If you want a *real* PR, `--pr` opens one from the staging branch when the
+run finishes (see below); for a CI gate (e.g. GitHub Actions), merge on green
+in the forge — the staging branch is exactly the PR branch.
+
+## Opening a real PR/MR (`--pr`)
+
+By default a run ends at the local acceptance gate above. With `pr_enabled`
+set, slop-churner additionally opens a real pull request when the run
+finishes, from the staging branch (`slop-churner/run`) to the base branch,
+titled with the prompt and listing each task's status in the body:
+
+- **CLI** — `slop-churner run "PROMPT" --pr`.
+- **Web UI** — the new-run form has an **"open a PR/MR when the run
+  finishes"** checkbox, sent as `pr_enabled: true` in `POST /api/runs`.
+
+The PR step is best-effort: a failure (e.g. an unauthenticated CLI) is
+logged but never changes the run's outcome — the local accept/reject gate
+still applies.
+
+**Requirements.** Install the GitHub CLI [`gh`](https://cli.github.com) or
+the GitLab CLI [`glab`](https://gitlab.com/gitlab-org/cli) on the server's
+PATH, then authenticate with `gh auth login` / `glab auth login` — or, for
+headless servers, set `GITHUB_TOKEN` / `GITLAB_TOKEN` in the environment.
+`gh` is preferred if both are present.
+
+**Status discovery.** `GET /api/forge` reports per-CLI availability and
+auth status, so the UI (and scripts) can check before enabling the flag:
+
+```bash
+curl -s http://127.0.0.1:8787/api/forge
+# {"forges": [{"name": "gh", "available": true, "authenticated": true, "detail": "ok"}, ...]}
+```
+
+The web form uses this on load: if no CLI is on PATH the checkbox is greyed
+out with a "PR opening unavailable" hint; if a CLI is present but not
+authenticated the checkbox stays usable but shows an amber warning with the
+fix (`<cli> auth login` or the matching `*_TOKEN`). The server mirrors this
+on `POST /api/runs`: `pr_enabled` with no CLI at all is rejected (400),
+while a present-but-unauthenticated CLI is accepted with a warning.
+
+**When disabled (the default)** nothing changes: the run parks in
+`awaiting_acceptance` and `slop-churner accept` / `reject` (or the UI
+buttons) handle the staging branch exactly as before.
 
 ## Design notes
 
@@ -243,8 +284,8 @@ staging branch is exactly the PR branch.
 
 - Sequential by design; parallel task execution is a natural next step (the
   planner already emits independent tasks).
-- The "PR" is a local merge into a staging branch; wire in real CI checks
-  (or a real remote) if you need them.
+- No CI gating on the opened PR/MR — merge it on green in the forge if you
+  want a real CI gate (e.g. GitHub Actions).
 - No cost/token budgeting yet (only wall-clock timeouts and iteration caps).
 - The planner is a single agent call; a critic/refine pass could improve task
   quality.
