@@ -58,6 +58,8 @@ class StubAgent:
         self.calls += 1
         if "planning stage" in prompt:
             return AgentResult(True, PLAN_JSON, 0, 0.1)
+        if "self-review stage" in prompt:
+            return AgentResult(True, "APPROVE\n- looks complete", 0, 0.1)
         # implement / fix
         app = cwd / "app.py"
         if "subtract" not in app.read_text():
@@ -217,6 +219,8 @@ def main_plan_supplied() -> int:
                 raise AssertionError(
                     "planner agent must not be invoked with a pre-supplied plan"
                 )
+            if "self-review stage" in prompt:
+                return AgentResult(True, "APPROVE\n- looks complete", 0, 0.1)
             app = cwd / "app.py"
             src = app.read_text()
             if "subtract" not in src:
@@ -408,6 +412,131 @@ def main_pr() -> int:
     return 0
 
 
+class ReviewStub:
+    """Fake agent that also answers the self-review stage with scripted verdicts."""
+
+    def __init__(self, verdicts):
+        self.verdicts = list(verdicts)
+        self.review_calls = 0
+        self.fix_prompts: list[str] = []
+
+    def __call__(self, cfg, prompt, *, cwd, tools=None, timeout=None, **kw):
+        if "planning stage" in prompt:
+            return AgentResult(True, PLAN_JSON, 0, 0.1)
+        if "fix stage" in prompt:
+            self.fix_prompts.append(prompt)
+        if "self-review stage" in prompt:
+            self.review_calls += 1
+            v = self.verdicts[min(self.review_calls - 1, len(self.verdicts) - 1)]
+            if kw.get("on_output"):
+                kw["on_output"](v + "\n")
+            return AgentResult(True, v, 0, 0.1)
+        # implement / fix
+        app = cwd / "app.py"
+        if "subtract" not in app.read_text():
+            app.write_text(
+                "def add(a, b):\n    return a + b\n\n"
+                "def subtract(a, b):\n    return a - b\n"
+            )
+        return AgentResult(True, "implemented subtract", 0, 0.1)
+
+
+def main_review() -> int:
+    """Self-review stage: APPROVE -> DONE + review log; REJECT then APPROVE
+    -> fix iteration; self_review=False -> no review call, no review log."""
+
+    def one_case(verdicts, self_review=True):
+        tmp = Path(tempfile.mkdtemp(prefix="slop-churner-smoke-review-"))
+        repo = tmp / "proj"
+        repo.mkdir()
+        make_repo(repo)
+        cfg = Config(repo=repo, base_branch="main", agent_cmd="pi",
+                     max_iterations=3, test_cmd="true", self_review=self_review)
+        stub = ReviewStub(verdicts)
+        planner.run_agent = stub
+        runner.run_agent = stub
+        stub_tests.n = 1  # tests start green
+        seen: list[tuple[str, dict]] = []
+        report = run(cfg, "add a subtract function",
+                     sink=lambda ev, payload: seen.append((ev, payload)))
+        return cfg, stub, seen, report
+
+    # 1) APPROVE: task completes DONE and a NN-review.log exists.
+    cfg, stub, seen, report = one_case(["APPROVE\n- looks good"])
+    assert report.all_done and report.done[0].status.value == "done", report
+    assert stub.review_calls == 1, stub.review_calls
+    logs = list(cfg.log_dir.glob("task*-*/[0-9][0-9]-review.log"))
+    assert logs, f"expected a review log under {cfg.log_dir}, got: " \
+                 f"{[str(p) for p in cfg.log_dir.rglob('*')]}"
+    assert "APPROVE" in logs[0].read_text()
+    steps = [p for n, p in seen if n == "step"]
+    assert any(p["stage"] == "review" and p["ok"] for p in steps), steps
+    assert any(n == "agent_output" and p["stage"] == "review" for n, p in seen)
+
+    # 2) REJECT then APPROVE: one fix iteration (iterations == 2), then DONE.
+    cfg, stub, seen, report = one_case([
+        "REJECT: subtract not added\n- missing subtract",
+        "APPROVE",
+    ])
+    assert report.all_done and report.done[0].status.value == "done", report
+    assert report.done[0].iterations == 2, report.done[0].iterations
+    assert stub.review_calls == 2, stub.review_calls
+    stages = [p["stage"] for n, p in seen if n == "step"]
+    assert stages[:6] == ["implement", "test", "review", "fix", "test", "review"], stages
+    # The fix loop was really invoked, citing the failed review stage.
+    assert any("PROBLEM: review" in p for p in stub.fix_prompts), stub.fix_prompts
+
+    # Change still staged on the run branch after the review-driven fix.
+    branches = subprocess.run(["git", "branch"], cwd=str(cfg.repo),
+                              capture_output=True, text=True).stdout
+    assert "slop-churner/run" in branches, branches
+    sh(cfg.repo, "git", "checkout", "slop-churner/run")
+    assert "def subtract" in (cfg.repo / "app.py").read_text(), \
+        "subtract should be staged on the run branch"
+    sh(cfg.repo, "git", "checkout", "main")
+
+    # 3) self_review=False: no review agent call, no review log.
+    cfg, stub, seen, report = one_case(["REJECT: should never be asked"],
+                                       self_review=False)
+    assert report.all_done, report
+    assert stub.review_calls == 0, stub.review_calls
+    assert not list(cfg.log_dir.glob("task*-*/[0-9][0-9]-review.log")), \
+        "no review log may be written when self_review is False"
+    stages = [p["stage"] for n, p in seen if n == "step"]
+    assert "review" not in stages, stages
+
+    print("\nSMOKE TEST (self-review) PASSED")
+    return 0
+
+
+def main_state_review() -> int:
+    """Status.REVIEW exists, is non-terminal, and Task round-trips it."""
+    from slop_churner.state import Status, Task, TERMINAL
+
+    assert Status.REVIEW.value == "review"
+    assert Status.REVIEW not in TERMINAL, "REVIEW is a non-terminal status"
+
+    t = Task(id=1, title="t", description="d", status=Status.REVIEW)
+    d = t.to_dict()
+    assert d["status"] == "review", d
+    t2 = Task.from_dict(d)
+    assert t2.status is Status.REVIEW
+    assert t2.title == t.title and t2.description == t.description
+    assert t2.iterations == 0 and t2.last_error is None
+
+    # Config: self_review defaults to True, can be turned off.
+    tmp = Path(tempfile.mkdtemp(prefix="slop-churner-state-"))
+    repo = tmp / "proj"
+    repo.mkdir()
+    make_repo(repo)
+    assert Config(repo=repo, base_branch="main", agent_cmd="pi").self_review is True
+    assert Config(repo=repo, base_branch="main", agent_cmd="pi",
+                  self_review=False).self_review is False
+
+    print("\nSMOKE TEST (state/review) PASSED")
+    return 0
+
+
 if __name__ == "__main__":
     raise SystemExit(main() or main_plan_supplied() or main_streaming()
-                      or main_pr())
+                      or main_pr() or main_review() or main_state_review())

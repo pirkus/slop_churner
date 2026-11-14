@@ -56,6 +56,8 @@ class StubAgent:
                 on_output(f"stub agent line {i}\n")
         if "planning stage" in prompt:
             return AgentResult(True, smoke.PLAN_JSON, 0, 0.2)
+        if "self-review stage" in prompt:
+            return AgentResult(True, "APPROVE\n- looks complete", 0, 0.2)
         app = cwd / "app.py"
         if "subtract" not in app.read_text():
             app.write_text(

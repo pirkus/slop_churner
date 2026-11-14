@@ -162,6 +162,7 @@ def run_task(
         committed_any = committed_any or gitutil.commit_all(
             wt, f"{task.title} (slop-churner task {task.id}, attempt {attempt})"
         )
+        implement_output = agent.output
 
         # 2) TEST ------------------------------------------------------------
         task.mark(Status.TESTING)
@@ -183,6 +184,42 @@ def run_task(
             if attempt >= cfg.max_iterations:
                 break
             continue
+
+        # 2b) SELF-REVIEW (advisory gate) ------------------------------------
+        if cfg.self_review:
+            task.mark(Status.REVIEW)
+            _save(state, cfg)
+            emit_task()
+            if dry_run:
+                print(f"    [dry-run] would run self-review")
+                return
+            print(f"    review: self-review…", flush=True)
+            agent = run_agent(cfg, prompts.review_prompt(task), cwd=wt,
+                              label=f"task {task.id}: self-review",
+                              on_output=lambda line: emit("agent_output", {
+                                  "task_id": task.id, "stage": "review", "line": line}))
+            _log(cfg, task, "review",
+                 f"$ agent rc={agent.returncode}\n{agent.output}")
+            emit("step", {
+                "task_id": task.id, "iteration": attempt, "stage": "review",
+                "ok": agent.ok, "output": agent.output,
+                "duration": agent.duration,
+            })
+            if not agent.ok and agent.returncode in (127, -1):
+                # Hard infra failure (missing binary / timeout): review is
+                # advisory, so a broken agent must not block the run.
+                print(f"    review: agent unavailable ({agent.output.splitlines()[0] if agent.output else 'infra failure'}); skipping self-review", flush=True)
+            else:
+                first_line = next((ln.strip() for ln in agent.output.splitlines()
+                                   if ln.strip()), "")
+                if first_line.lower().startswith("reject"):
+                    print(f"    review: REJECTED — {first_line}", flush=True)
+                    last_error = agent.output
+                    last_stage = "review"
+                    if attempt >= cfg.max_iterations:
+                        break
+                    continue
+                print(f"    review: {first_line or '(no verdict line)'} → proceeding", flush=True)
 
         # 3) PR (local merge) ------------------------------------------------
         task.mark(Status.PR)
@@ -210,7 +247,9 @@ def run_task(
         # 4) DONE ------------------------------------------------------------
         task.status = Status.DONE
         task.last_error = None
-        task.summary = (agent.output[-800:] if agent.output else None)
+        # Keep the implement/fix summary (the review agent may have clobbered
+        # `agent` with its APPROVE/REJECT verdict).
+        task.summary = (implement_output[-800:] if implement_output else None)
         _cleanup(cfg, state, task, wt)
         _save(state, cfg)
         emit_task()
