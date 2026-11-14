@@ -6,6 +6,7 @@ A sink is a plain callable receiving ``(event_name, data)`` pairs:
 - ``planned``      {tasks: [task_dict...], test_cmd}
 - ``task_updated`` {id, title, description, status, iterations, ...}
 - ``step``         {task_id, iteration, stage, ok, output, duration}
+                    (stage: "implement" | "fix" | "test" | "review" | "pr")
 - ``agent_output`` {label, line}   (planning; one event per streamed line)
                     {task_id, stage, line} (implement/fix; live only, not persisted)
 - ``run_finished`` {status, done, failed, skipped, duration}
