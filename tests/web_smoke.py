@@ -148,6 +148,9 @@ def main() -> int:
         'doAction("accept")', 'doAction("discard")', "Reject",
         # transcript pane (persisted history + live streaming) + SSE handler
         "transcript", "tstep", "/transcript", 'name === "agent_output"',
+        # PR/MR availability-aware checkbox (server-side gh/glab detection)
+        'id="f-pr"', "open a PR/MR when the run finishes", "f-pr-hint",
+        "pr_enabled", "/api/forge", "loadForgeStatus", "formwarn",
     ):
         assert needle in page, f"ui.html is missing {needle!r}"
 
