@@ -17,6 +17,7 @@ class Config:
     budget: int | None = None        # global cap on agent calls (None = unlimited)
     test_cmd: str | None = None      # override; default comes from tasks.json / autodetect
     pr_check_cmd: str | None = None  # optional hook run before merge (e.g. CI checks)
+    pr_enabled: bool = False         # open a PR/MR on the forge when the run finishes
     agent_timeout: int = 1800        # seconds per agent call
     test_timeout: int = 900          # seconds per test run
 

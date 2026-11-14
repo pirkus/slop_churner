@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from . import events, gitutil, planner, runner
+from . import events, forge, gitutil, planner, runner
 from .config import Config
 from .errors import SlopChurnerError
 from .state import State, Status, Task
@@ -158,6 +158,9 @@ def run(
             "files": review["files"],
             "commits": review["commits"],
         })
+        if (cfg.pr_enabled and cfg.run_branch
+                and gitutil.branch_exists(cfg.repo, cfg.run_branch)):
+            _open_pr(cfg, state, emit)
     emit("run_finished", {
         "status": "done" if report.all_done else ("cancelled" if cancelled() else "failed"),
         "done": len(done),
@@ -185,6 +188,33 @@ def reject_run(cfg: Config, state: State) -> None:
     gitutil.reject_run(cfg.repo, state.run_branch, state.base_branch)
     state.run_branch = None
     state.save(cfg.state_path)
+
+
+def _open_pr(cfg: Config, state: State, emit: events.Sink) -> None:
+    """Open a PR/MR for the staged run (best effort; never changes the outcome)."""
+    try:
+        title = "slop-churner: " + state.prompt[:60]
+        body = "\n".join(f"{t.id}. {t.title} — {t.status.value}" for t in state.tasks)
+        result = forge.create_pr(
+            cfg.repo,
+            base=state.base_branch,
+            head=cfg.run_branch,
+            title=title,
+            body=body,
+        )
+        if result.ok:
+            print(f"slop-churner: opened {result.url}")
+        else:
+            print(f"slop-churner: PR creation failed: {result.error} — "
+                  f"work is still staged on '{cfg.run_branch}'; "
+                  f"accept it locally or retry manually")
+        emit("pr_created", {
+            "url": result.url,
+            "ok": result.ok,
+            "error": result.error or None,
+        })
+    except Exception as e:  # PR creation must never alter the run outcome
+        print(f"slop-churner: warning: PR creation failed unexpectedly: {e}")
 
 
 def _run_one(cfg: Config, state: State, task: Task, *, dry_run: bool, emit: events.Sink) -> None:
