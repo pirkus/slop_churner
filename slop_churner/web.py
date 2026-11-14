@@ -49,7 +49,7 @@ try:
 except ImportError:  # h2 not installed -> HTTP/1.1 only
     _H2 = False
 
-from . import __version__, engine, events, gitutil, planner
+from . import __version__, engine, events, forge, gitutil, planner
 from .config import Config
 from .errors import SlopChurnerError
 from .state import State
@@ -109,6 +109,15 @@ class WebSink:
 # ---------------------------------------------------------------------------
 # Run workers
 # ---------------------------------------------------------------------------
+
+def _pr_warning(cli: str) -> str:
+    """Human hint for an available-but-unauthenticated forge CLI."""
+    hint = {
+        "gh": "set GITHUB_TOKEN or run gh auth login",
+        "glab": "set GITLAB_TOKEN or run glab auth login",
+    }.get(cli, f"run {cli} auth login")
+    return f"{cli} not authenticated (no token?) — {hint}"
+
 
 def _build_cfg(params: dict[str, Any]) -> Config:
     def _int(key: str, default: int | None) -> int | None:
@@ -309,6 +318,12 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/health":
                 self._json(200, {"ok": True, "version": __version__,
                                  "db": str(self.ctx.store.path)})
+            elif path == "/api/forge":
+                self._json(200, {"forges": [
+                    {"name": i.name, "available": i.available,
+                     "authenticated": i.authenticated, "detail": i.detail}
+                    for i in forge.check_forge()
+                ]})
             elif path == "/api/runs":
                 runs = []
                 for r in self.ctx.store.list_runs():
@@ -377,6 +392,17 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": "prompt is required"})
             return
         repo = (b.get("repo") or ".").strip()
+        # pr_enabled guard: opening a PR/MR needs a forge CLI on the server.
+        # No CLI at all -> refuse; a CLI present but not authenticated is a
+        # warning only (the run may still be useful, and auth can happen later).
+        warnings: list[str] = []
+        if b.get("pr_enabled"):
+            available = [i for i in forge.check_forge() if i.available]
+            if not available:
+                self._json(400, {"error": "pr_enabled but no gh/glab CLI found on the server"})
+                return
+            if not any(i.authenticated for i in available):
+                warnings.append(_pr_warning(available[0].name))
         try:
             run_id = self.ctx.store.create_run(repo, prompt, {k: b.get(k) for k in (
                 "repo", "base", "agent", "model", "max_iterations", "max_tasks",
@@ -404,7 +430,10 @@ class Handler(BaseHTTPRequestHandler):
         t = threading.Thread(target=_planning_worker, args=(self.ctx, run_id, b),
                              name=f"slop-churner-plan-{run_id}", daemon=True)
         t.start()
-        self._json(201, {"run_id": run_id})
+        payload: dict[str, Any] = {"run_id": run_id}
+        if warnings:
+            payload["warnings"] = warnings
+        self._json(201, payload)
 
     def _update_plan(self, run_id: int) -> None:
         row = self.ctx.store.get_run(run_id)
