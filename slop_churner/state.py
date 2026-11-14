@@ -14,6 +14,7 @@ class Status(str, Enum):
     TESTING = "testing"
     PR = "pr"
     FIXING = "fixing"
+    REVIEW = "review"
     DONE = "done"
     FAILED = "failed"
 
