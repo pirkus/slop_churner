@@ -147,6 +147,8 @@ def main() -> int:
         "awaiting_approval", "planReview", "Add task", "Approve and start",
         "Reject", "remove", 'plan_test_cmd', 'method: "PUT"',
         "/plan", "/approve", "/reject", 'name === "planned"',
+        # per-task discuss button + panel (POST /tasks/{id}/discuss)
+        "Discuss this task", "discuss", "/discuss",
         # acceptance gate UI
         "awaiting_acceptance", "diffReview", "Accept", "/diff",
         'doAction("accept")', 'doAction("discard")', "Reject",
