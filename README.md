@@ -1,7 +1,7 @@
 # slop-churner
 
 An autonomous development loop. Give it a prompt; it decomposes the request
-into small tasks, then — for each task — runs an **implement → test → PR**
+into small tasks, then — for each task — runs an **implement → test → self-review → PR**
 cycle, and on any failure re-enters a **fix** loop until it's green or the
 iteration budget is exhausted.
 
@@ -22,12 +22,12 @@ run is resumable and easy to inspect.
         ┌──────────────────────────┴───────────────────────────────────────┐
         │ for each task (sequentially, on a dedicated worktree + branch)   │
         │                                                                  │
-        │   ┌─────────┐   ┌─────────┐   ┌─────────┐                        │
-        │   │IMPL/FIX │──▶│  TEST   │──▶│   PR    │──▶ merged? ──▶ next task
-        │   └─────────┘   └─────────┘   └─────────┘     │                 │
-        │        ▲                                        │ no (fail)       │
-        │        └────────────────────────────────────────┘                │
-        │              (fix loop, up to --max-iterations)                 │
+        │   ┌─────────┐   ┌─────────┐   ┌─────────┐   ┌─────────┐         │
+        │   │IMPL/FIX │──▶│  TEST   │──▶│ REVIEW  │──▶│   PR    │──▶ next │
+        │   └─────────┘   └─────────┘   └─────────┘   └────┬────┘  task   │
+        │        ▲                                          │              │
+        │        └──────────────────────────────────────────┘              │
+        │        any step fails → fix loop (up to --max-iterations)        │
         └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -69,10 +69,17 @@ What happens:
    the run's *staging branch* (so each task builds on the previous ones), then loops:
    - **implement/fix** — a fresh agent implements (or fixes) the task.
    - **test** — slop-churner runs the test command in the worktree.
+   - **self-review** — a fresh agent inspects the diff against the task
+     description (completeness, correctness, scope creep, leftover debug
+code) and must answer `APPROVE` or `REJECT: <reason>`. It's an *advisory*
+     gate: a `REJECT` feeds back into the fix loop like a failing test, and
+     if the reviewer agent is unavailable the stage is skipped rather than
+     blocking the run (disable entirely with `self_review = False` in
+     `slop_churner/config.py`).
    - **PR** — commits and merges the branch into the staging branch
      (`slop-churner/run`, or `slop-churner/run-<id>` in the web UI). Best-effort push if a
      remote exists. **Your base branch is not touched yet.**
-   - If test or PR fails, the failure log is fed back into the **fix** step.
+   - If test, self-review, or PR fails, the failure log is fed back into the **fix** step.
 3. **Review gate** — when the run finishes, slop-churner shows a per-file diff
    (`base...staging`) and asks you to decide:
    - **accept** — the staging branch is merged into your base branch and all
@@ -140,7 +147,7 @@ Features:
 - **Live progress** — runs execute in the background; task statuses and step
   logs update in real time over Server-Sent Events (no page refresh).
 - **Step logs** — expand any task to see each iteration's `implement`/`fix`,
-  `test` and `pr` transcript with pass/fail and duration.
+  `test`, `review` and `pr` transcripts with pass/fail and duration.
 - **Cancel & retry** — cancel an active run (takes effect at the next safe
   point), or retry a failed task from its row.
 - **Acceptance gate** — when a run finishes, it parks in
@@ -181,7 +188,7 @@ are shared), enforced by the server.
 | `--base` | `main` | base branch to branch off / merge into |
 | `--agent` | `pi` | agent binary to invoke |
 | `--model` | — | model pattern/ID passed to the agent |
-| `--max-iterations` | `3` | implement→test→PR attempts per task |
+| `--max-iterations` | `3` | implement→test→review→PR attempts per task |
 | `--max-tasks` | `8` | cap on how many tasks the planner may emit |
 | `--budget` | ∞ | global cap on total iterations across all tasks |
 | `--test-cmd` | planner's | override the test command |
@@ -274,9 +281,11 @@ buttons) handle the staging branch exactly as before.
   staging branch before the next starts, and each new task branches off that
   tip — so task N+1 is implemented against a repo that already contains 1..N.
   That matches the planner's contract and avoids cross-task merge tangles.
-- **The fix loop is the inner loop.** `test` and `PR` are gates; failing
-  either one routes back to the `fix` agent with the captured failure log,
-  up to `--max-iterations`.
+- **The fix loop is the inner loop.** `test`, `self-review` and `PR` are
+  gates; failing any of them routes back to the `fix` agent with the
+  captured failure log, up to `--max-iterations`. `self-review` is advisory
+  in one extra sense: if the reviewer agent can't run at all (infra
+  failure), the stage is skipped instead of failing the task.
 - **Failures are inspectable, not destructive.** A failed task's worktree is
   left in place and its last error is recorded in `state.json`.
 
