@@ -164,6 +164,9 @@
 
   .planrow { border: 1px solid var(--border); border-radius: 10px; background: var(--panel); margin-bottom: 10px; padding: 10px 12px; }
   .planrow .top { display: flex; align-items: center; gap: 8px; }
+  .planrow .drag { cursor: grab; color: var(--dim); font-size: 14px; line-height: 1; padding: 2px 0; user-select: none; }
+  .planrow .drag:hover { color: var(--text); }
+  .planrow.dragging { opacity: .45; }
   .planrow .num { color: var(--dim); font: 12px var(--mono); min-width: 24px; }
   .planrow .title { flex: 1; }
   .planrow .desc { margin-top: 8px; }
@@ -646,11 +649,34 @@ function planReview(data) {
   const renumber = () => {
     list.querySelectorAll(".planrow .num").forEach((n, i) => { n.textContent = (i + 1) + "."; });
   };
+  // native HTML5 drag & drop reordering, started only from the drag handle
+  let dragged = null;
+  const getAfterElement = (y) => {
+    const rows = [...list.querySelectorAll(".planrow:not(.dragging)")];
+    return rows.find((r) => {
+      const b = r.getBoundingClientRect();
+      return y < b.bottom && y > b.top + b.height / 2;
+    }) || null;
+  };
+  list.addEventListener("dragover", (e) => {
+    if (!dragged) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    const after = getAfterElement(e.clientY);
+    if (after === dragged) return;
+    list.insertBefore(dragged, after);
+    renumber();
+  });
+  list.addEventListener("drop", (e) => { if (dragged) e.preventDefault(); });
   const addRow = (t) => {
     const row = document.createElement("div");
     row.className = "planrow";
+    row.draggable = true;
     const top = document.createElement("div");
     top.className = "top";
+    const drag = document.createElement("span");
+    drag.className = "drag"; drag.textContent = "\u283F"; drag.title = "Drag to reorder";
+    drag.setAttribute("aria-label", "Drag to reorder");
     const num = document.createElement("span");
     num.className = "num";
     const ti = document.createElement("input");
@@ -663,7 +689,20 @@ function planReview(data) {
     const rm = document.createElement("button");
     rm.type = "button"; rm.className = "ghost"; rm.textContent = "remove";
     rm.onclick = () => { row.remove(); renumber(); };
-    top.append(num, ti, dc, rm);
+    row.addEventListener("dragstart", (e) => {
+      // only the handle starts a drag (not the inputs/buttons)
+      if (e.target !== drag && !drag.contains(e.target)) { e.preventDefault(); return; }
+      e.dataTransfer.effectAllowed = "move";
+      try { e.dataTransfer.setData("text/plain", ""); } catch (_) { /* required by Firefox */ }
+      dragged = row;
+      row.classList.add("dragging");
+    });
+    row.addEventListener("dragend", () => {
+      row.classList.remove("dragging");
+      if (dragged === row) dragged = null;
+      renumber();
+    });
+    top.append(drag, num, ti, dc, rm);
     const de = document.createElement("textarea");
     de.className = "desc"; de.placeholder = "what should this task accomplish?";
     de.value = t ? (t.description || "") : "";
