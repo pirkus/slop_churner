@@ -330,6 +330,31 @@ def main() -> int:
     assert any(r["id"] == rid and r["n_done"] == 2 and r["n_tasks"] == 2
                and r["status"] == "accepted" for r in lst), lst
 
+    # -- archive / unarchive ---------------------------------------------------
+    a = api_call("POST", f"{base}/api/runs/{rid}/archive")
+    assert a == {"ok": True, "archived": True}, a
+    # Archived runs are hidden from the default list...
+    lst = api_call("GET", f"{base}/api/runs")["runs"]
+    assert all(r["id"] != rid for r in lst), lst
+    # ...but still listed when include_archived is set (1 or true).
+    for val in ("1", "true"):
+        lst = api_call("GET", f"{base}/api/runs?include_archived={val}")["runs"]
+        archived_row = next(r for r in lst if r["id"] == rid)
+        assert archived_row["archived"] == 1, archived_row
+    # An archived run is still fully readable by id.
+    run = api_call("GET", f"{base}/api/runs/{rid}")
+    assert run["status"] == "accepted" and run["archived"] == 1, run
+    assert len(run["tasks"]) == 2, run
+    # Unarchive restores it to the default list.
+    u = api_call("POST", f"{base}/api/runs/{rid}/unarchive")
+    assert u == {"ok": True, "archived": False}, u
+    lst = api_call("GET", f"{base}/api/runs")["runs"]
+    row = next(r for r in lst if r["id"] == rid)
+    assert row["archived"] == 0, row
+    # Unknown run -> 404 (both directions).
+    expect_error("POST", f"{base}/api/runs/999999/archive", 404)
+    expect_error("POST", f"{base}/api/runs/999999/unarchive", 404)
+
     # -- plan review endpoints reject once the run is no longer awaiting -------
     expect_error("PUT", f"{base}/api/runs/{rid}/plan", 409, edited)
     expect_error("POST", f"{base}/api/runs/{rid}/approve", 409)
