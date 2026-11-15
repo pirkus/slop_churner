@@ -71,7 +71,9 @@
   }
   .runitem:hover { border-color: var(--dim); }
   .runitem.active { border-color: var(--accent); }
+  .runitem.archived { opacity: .6; }
   .runitem .top { display: flex; align-items: center; gap: 8px; }
+  .runitem button.act { padding: 1px 8px; font-size: 12px; line-height: 1.6; }
   .runitem .prompt { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
   .runitem .meta { color: var(--dim); font-size: 12px; margin-top: 3px; display: flex; gap: 10px; }
 
@@ -80,6 +82,7 @@
     border: 1px solid; letter-spacing: .03em; white-space: nowrap;
   }
   .pill.pending, .pill.queued, .pill.cancelled { color: var(--dim); border-color: var(--dim); }
+  .pill.archived { color: var(--dim); border-color: var(--dim); border-style: dashed; }
   .pill.planning, .pill.pr { color: var(--accent); border-color: var(--accent); }
   .pill.awaiting_approval { color: var(--amber); border-color: var(--amber); }
   .pill.awaiting_acceptance { color: #b085f5; border-color: #b085f5; }
@@ -248,6 +251,10 @@
     </form>
 
     <h2 style="margin-top:24px">Runs</h2>
+    <label for="showarchived" class="checklabel" style="margin: -4px 0 8px">
+      <input type="checkbox" id="showarchived">
+      show archived
+    </label>
     <div class="runlist" id="runlist"></div>
   </aside>
 
@@ -261,6 +268,7 @@
 const $ = (id) => document.getElementById(id);
 let selectedRun = null;
 let selectedStatus = null;     // last observed status of the selected run
+let showArchived = false;      // show archived runs in the list
 let es = null;                 // active EventSource
 let live = false;              // is the selected run actively running?
 let liveKey = null;            // key of the transcript step currently streaming
@@ -306,7 +314,7 @@ function pill(status) {
 
 async function loadRuns() {
   try {
-    const { runs } = await api("/api/runs");
+    const { runs } = await api("/api/runs" + (showArchived ? "?include_archived=1" : ""));
     const list = $("runlist");
     list.innerHTML = "";
     if (!runs.length) {
@@ -317,14 +325,32 @@ async function loadRuns() {
     }
     for (const r of runs) {
       const item = document.createElement("div");
-      item.className = "runitem" + (r.id === selectedRun ? " active" : "");
+      item.className = "runitem" + (r.id === selectedRun ? " active" : "")
+        + (r.archived ? " archived" : "");
       const top = document.createElement("div");
       top.className = "top";
       top.appendChild(pill(r.status));
+      if (r.archived) top.appendChild(pill("archived"));
       const p = document.createElement("span");
       p.className = "prompt";
       esc(p, r.prompt);
       top.appendChild(p);
+      const act = document.createElement("button");
+      act.type = "button";
+      act.className = "ghost act";
+      act.textContent = r.archived ? "📤" : "🗄";
+      act.title = r.archived ? "Unarchive run" : "Archive run";
+      act.setAttribute("aria-label", act.title);
+      act.onclick = async (ev) => {
+        ev.stopPropagation();  // archive/unarchive must not select the run
+        act.disabled = true;
+        try {
+          await api(`/api/runs/${r.id}/${r.archived ? "unarchive" : "archive"}`,
+                    { method: "POST" });
+        } catch (e) { act.disabled = false; return; }
+        loadRuns();
+      };
+      top.appendChild(act);
       const meta = document.createElement("div");
       meta.className = "meta";
       const m1 = document.createElement("span"); esc(m1, r.repo);
@@ -405,6 +431,19 @@ function renderRun(data) {
       b.disabled = true;
       try { await api(`/api/runs/${data.id}/cancel`, { method: "POST" }); }
       catch (e) { b.disabled = false; alert(e.message); }
+    };
+    top.appendChild(b);
+  }
+  if (data.archived) {
+    const b = document.createElement("button");
+    b.className = "ghost"; b.textContent = "Unarchive";
+    b.onclick = async () => {
+      b.disabled = true;
+      try {
+        await api(`/api/runs/${data.id}/unarchive`, { method: "POST" });
+        loadRuns();
+        selectRun(data.id);
+      } catch (e) { b.disabled = false; alert(e.message); }
     };
     top.appendChild(b);
   }
@@ -1269,6 +1308,10 @@ async function loadForgeStatus() {
     $("dbpath").textContent = h.db;
   } catch {}
   await loadForgeStatus();
+  $("showarchived").addEventListener("change", (e) => {
+    showArchived = e.target.checked;
+    loadRuns();
+  });
   await loadRuns();
   setInterval(() => {
     loadRuns();
