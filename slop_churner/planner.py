@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import events, prompts
-from .agent import run_agent
+from .agent import AgentResult, run_agent
 from .config import Config
 from .errors import SlopChurnerError
 from .state import State, Task
@@ -93,6 +93,33 @@ def plan(cfg: Config, request: str, sink: events.Sink | None = None) -> Plan:
         )
     plan = _validate(_extract_json(result.output), cfg.max_tasks)
     return plan
+
+
+def discuss(cfg: Config, request: str, plan: Plan, task_index: int,
+            task: Task, message: str,
+            sink: events.Sink | None = None) -> AgentResult:
+    """Answer a user question about one planned task (awaiting_approval).
+
+    If a ``sink`` is given, every streamed discuss stdout line is emitted
+    as an ``agent_output`` event (live progress; not persisted).
+    """
+    emit = sink or events.noop
+    prompt = prompts.discuss_prompt(request, plan.tasks, task_index, task, message)
+    result = run_agent(
+        cfg,
+        prompt,
+        cwd=cfg.repo,
+        timeout=cfg.agent_timeout,
+        label="discuss",
+        on_output=lambda line: emit("agent_output", {"label": "discuss", "line": line}),
+    )
+    # Hard infra failures (missing binary, timeout) are not retryable here.
+    if result.returncode in (127, -1) or (not result.ok and not result.output.strip()):
+        detail = (result.error or result.output or "no output").strip()
+        raise SlopChurnerError(
+            f"discuss agent could not run (rc={result.returncode}): {detail}"
+        )
+    return result
 
 
 def build_state(cfg: Config, request: str, plan: Plan) -> State:
