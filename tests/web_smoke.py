@@ -58,6 +58,8 @@ class StubAgent:
             return AgentResult(True, smoke.PLAN_JSON, 0, 0.2)
         if "self-review stage" in prompt:
             return AgentResult(True, "APPROVE\n- looks complete", 0, 0.2)
+        if "discuss stage" in prompt:
+            return AgentResult(True, "DISCUSS-REPLY", 0, 0.2)
         app = cwd / "app.py"
         if "subtract" not in app.read_text():
             app.write_text(
@@ -145,6 +147,8 @@ def main() -> int:
         "awaiting_approval", "planReview", "Add task", "Approve and start",
         "Reject", "remove", 'plan_test_cmd', 'method: "PUT"',
         "/plan", "/approve", "/reject", 'name === "planned"',
+        # per-task discuss button + panel (POST /tasks/{id}/discuss)
+        "Discuss this task", "discuss", "/discuss",
         # acceptance gate UI
         "awaiting_acceptance", "diffReview", "Accept", "/diff",
         'doAction("accept")', 'doAction("discard")', "Reject",
@@ -205,6 +209,18 @@ def main() -> int:
     expect_error("PUT", f"{base}/api/runs/{rid}/plan", 400,
                  {"tasks": [{"task_id": 1, "title": "x", "description": "d"}],
                   "test_cmd": 42})
+
+    # -- discuss a task while awaiting approval (POST /tasks/{id}/discuss) ----
+    d = api_call("POST", f"{base}/api/runs/{rid}/tasks/1/discuss",
+                 {"message": "why split this?"})
+    assert d["ok"] is True and d["reply"] == "DISCUSS-REPLY", d
+    # Validation: empty/missing message -> 400; unknown task -> 404.
+    expect_error("POST", f"{base}/api/runs/{rid}/tasks/1/discuss", 400, {"message": ""})
+    expect_error("POST", f"{base}/api/runs/{rid}/tasks/1/discuss", 400, {})
+    expect_error("POST", f"{base}/api/runs/{rid}/tasks/99/discuss", 404,
+                 {"message": "why split this?"})
+    # Still nothing executed.
+    assert "def subtract" not in (repo / "app.py").read_text()
 
     # -- SSE: subscribe, then approve; live events must stream ----------------
     conn = HTTPConnection("127.0.0.1", port, timeout=30)
@@ -318,6 +334,9 @@ def main() -> int:
     expect_error("PUT", f"{base}/api/runs/{rid}/plan", 409, edited)
     expect_error("POST", f"{base}/api/runs/{rid}/approve", 409)
     expect_error("POST", f"{base}/api/runs/{rid}/reject", 409)
+    # Discuss is refused once the run is no longer awaiting approval.
+    expect_error("POST", f"{base}/api/runs/{rid}/tasks/1/discuss", 409,
+                 {"message": "why split this?"})
 
     # -- store plan API: get_plan / replace_tasks -------------------------------
     # Migration: an old-schema DB (no plan_test_cmd) must gain the column.

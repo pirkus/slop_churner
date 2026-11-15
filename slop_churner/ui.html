@@ -164,9 +164,19 @@
 
   .planrow { border: 1px solid var(--border); border-radius: 10px; background: var(--panel); margin-bottom: 10px; padding: 10px 12px; }
   .planrow .top { display: flex; align-items: center; gap: 8px; }
+  .planrow .drag { cursor: grab; color: var(--dim); font-size: 14px; line-height: 1; padding: 2px 0; user-select: none; }
+  .planrow .drag:hover { color: var(--text); }
+  .planrow.dragging { opacity: .45; }
   .planrow .num { color: var(--dim); font: 12px var(--mono); min-width: 24px; }
   .planrow .title { flex: 1; }
   .planrow .desc { margin-top: 8px; }
+  .planrow .discuss { margin-top: 8px; border-top: 1px solid var(--border); padding-top: 8px; display: none; }
+  .planrow .discuss.open { display: block; }
+  .planrow .discuss .drow { display: flex; gap: 8px; }
+  .planrow .discuss .drow input { flex: 1; }
+  .planrow .discuss .dbusy { color: var(--dim); font-size: 12px; margin-top: 6px; display: none; }
+  .planrow .discuss .derr { color: var(--red); font-size: 12px; margin-top: 6px; white-space: pre-wrap; }
+  .planrow .discuss .dresp { margin-top: 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; color: var(--text); font-size: 13px; white-space: pre-wrap; display: none; }
 </style>
 </head>
 <body>
@@ -639,24 +649,118 @@ function planReview(data) {
   const renumber = () => {
     list.querySelectorAll(".planrow .num").forEach((n, i) => { n.textContent = (i + 1) + "."; });
   };
+  // native HTML5 drag & drop reordering, started only from the drag handle
+  let dragged = null;
+  const getAfterElement = (y) => {
+    const rows = [...list.querySelectorAll(".planrow:not(.dragging)")];
+    return rows.find((r) => {
+      const b = r.getBoundingClientRect();
+      return y < b.bottom && y > b.top + b.height / 2;
+    }) || null;
+  };
+  list.addEventListener("dragover", (e) => {
+    if (!dragged) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    const after = getAfterElement(e.clientY);
+    if (after === dragged) return;
+    list.insertBefore(dragged, after);
+    renumber();
+  });
+  list.addEventListener("drop", (e) => { if (dragged) e.preventDefault(); });
   const addRow = (t) => {
     const row = document.createElement("div");
     row.className = "planrow";
+    row.draggable = true;
     const top = document.createElement("div");
     top.className = "top";
+    const drag = document.createElement("span");
+    drag.className = "drag"; drag.textContent = "\u283F"; drag.title = "Drag to reorder";
+    drag.setAttribute("aria-label", "Drag to reorder");
     const num = document.createElement("span");
     num.className = "num";
     const ti = document.createElement("input");
     ti.type = "text"; ti.className = "title"; ti.placeholder = "task title";
     ti.value = t ? (t.title || "") : "";
+    const dc = document.createElement("button");
+    dc.type = "button"; dc.className = "ghost"; dc.textContent = "💬";
+    dc.title = "Discuss this task";
+    dc.setAttribute("aria-label", "Discuss this task");
     const rm = document.createElement("button");
     rm.type = "button"; rm.className = "ghost"; rm.textContent = "remove";
     rm.onclick = () => { row.remove(); renumber(); };
-    top.append(num, ti, rm);
+    row.addEventListener("dragstart", (e) => {
+      // only the handle starts a drag (not the inputs/buttons)
+      if (e.target !== drag && !drag.contains(e.target)) { e.preventDefault(); return; }
+      e.dataTransfer.effectAllowed = "move";
+      try { e.dataTransfer.setData("text/plain", ""); } catch (_) { /* required by Firefox */ }
+      dragged = row;
+      row.classList.add("dragging");
+    });
+    row.addEventListener("dragend", () => {
+      row.classList.remove("dragging");
+      if (dragged === row) dragged = null;
+      renumber();
+    });
+    top.append(drag, num, ti, dc, rm);
     const de = document.createElement("textarea");
     de.className = "desc"; de.placeholder = "what should this task accomplish?";
     de.value = t ? (t.description || "") : "";
-    row.append(top, de);
+
+    // discussion panel: ask the agent about this task without touching the
+    // editable title/description (a discussion must not dirty the plan).
+    const dbox = document.createElement("div");
+    dbox.className = "discuss";
+    const drow = document.createElement("div");
+    drow.className = "drow";
+    const din = document.createElement("input");
+    din.type = "text"; din.placeholder = "ask the agent about this task…";
+    const dsend = document.createElement("button");
+    dsend.type = "button"; dsend.textContent = "send";
+    drow.append(din, dsend);
+    const dbusy = document.createElement("div");
+    dbusy.className = "dbusy"; dbusy.textContent = "thinking…";
+    const derr = document.createElement("div");
+    derr.className = "derr";
+    const dresp = document.createElement("div");
+    dresp.className = "dresp";
+    dbox.append(drow, dbusy, derr, dresp);
+
+    const discuss = async () => {
+      const message = din.value.trim();
+      if (!message || din.disabled) return;
+      derr.textContent = "";
+      // task_id is the row's 1-based position in the current list (the
+      // same ordering renumber() uses).
+      const taskId = [...list.querySelectorAll(".planrow")].indexOf(row) + 1;
+      din.disabled = true;
+      dsend.disabled = true;
+      dbusy.style.display = "block";
+      try {
+        const d = await api(`/api/runs/${data.id}/tasks/${taskId}/discuss`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message }),
+        });
+        esc(dresp, d.reply);
+        dresp.style.display = "block";
+      } catch (e) {
+        derr.textContent = e.message;
+      } finally {
+        din.disabled = false;
+        dsend.disabled = false;
+        dbusy.style.display = "none";
+        din.focus();
+      }
+    };
+    dc.onclick = () => {
+      dbox.classList.toggle("open");
+      if (dbox.classList.contains("open")) din.focus();
+    };
+    dsend.onclick = discuss;
+    din.addEventListener("keydown", (e) => { if (e.key === "Enter") discuss(); });
+
+    row.append(top, de, dbox);
     list.appendChild(row);
     renumber();
   };
