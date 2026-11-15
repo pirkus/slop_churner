@@ -62,6 +62,22 @@ def main() -> None:
           "{" not in review.replace("{task_id}", "").replace("{title}", "")
           .replace("{description}", ""))
 
+    # discuss_prompt is the new builder.
+    task2 = FakeTask()
+    task2.id = 8
+    task2.title = "Add feature Y"
+    task2.description = "Do Q, with acceptance criteria."
+    discuss = prompts.discuss_prompt(
+        "add a subtract function", [task, task2], 1, task, "why split this?")
+    check("discuss_prompt mentions discuss stage", "discuss stage" in discuss)
+    check("discuss_prompt has the request", "add a subtract function" in discuss)
+    check("discuss_prompt lists every planned task", "Add feature Y" in discuss)
+    check("discuss_prompt names the discussed task", "task 1" in discuss)
+    check("discuss_prompt has the task title", "Add feature X" in discuss)
+    check("discuss_prompt has the user message", "why split this?" in discuss)
+    check("discuss_prompt asks for prose advice", "plain prose" in discuss)
+    check("discuss_prompt covers neighbours", "neighbours" in discuss)
+
     print("All prompts tests passed.")
 
 

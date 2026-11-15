@@ -368,6 +368,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._discard_run(int(m.group(1)))
             elif m := re.fullmatch(r"/api/runs/(\d+)/retry/(\d+)", path):
                 self._retry(int(m.group(1)), int(m.group(2)))
+            elif m := re.fullmatch(r"/api/runs/(\d+)/tasks/(\d+)/discuss", path):
+                self._discuss_task(int(m.group(1)), int(m.group(2)))
             else:
                 self._json(404, {"error": "not found"})
         except BrokenPipeError:
@@ -634,6 +636,63 @@ class Handler(BaseHTTPRequestHandler):
             return
         cancel.set()
         self._json(200, {"ok": True})
+
+    def _discuss_task(self, run_id: int, task_id: int) -> None:
+        """Discuss one planned task with the agent while awaiting approval."""
+        row = self.ctx.store.get_run(run_id)
+        if row is None:
+            self._json(404, {"error": "no such run"})
+            return
+        if row["status"] != "awaiting_approval":
+            self._json(409, {"error": "tasks can only be discussed while the run is awaiting approval"})
+            return
+        b = self._body()
+        message = b.get("message")
+        if not isinstance(message, str) or not message.strip():
+            self._json(400, {"error": "'message' must be a non-empty string"})
+            return
+        stored = self.ctx.store.get_plan(run_id)
+        if stored is None or not stored["tasks"]:
+            self._json(404, {"error": "no such task"})
+            return
+        # Rebuild the plan objects from the stored dicts (same pattern as _worker).
+        tasks = [planner.Task(id=int(t["task_id"]), title=t["title"],
+                              description=t["description"])
+                 for t in stored["tasks"]]
+        task = next((t for t in tasks if t.id == task_id), None)
+        if task is None:
+            self._json(404, {"error": "no such task"})
+            return
+        plan = planner.Plan(test_cmd=stored["test_cmd"], tasks=tasks)
+        params = {**row["params"], "prompt": row["prompt"]}
+        try:
+            cfg = _build_cfg(params)
+        except SlopChurnerError as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        # Stream the discuss agent's live output to the UI over SSE (same
+        # agent_output shape the engine uses; not persisted).
+        def sink(name: str, data: dict[str, Any]) -> None:
+            self.ctx.hub.publish(run_id, {"name": name, "data": {
+                "stage": "discuss", "task_id": task_id,
+                "line": data.get("line", ""),
+            }})
+        try:
+            result = planner.discuss(
+                cfg, row["prompt"], plan, tasks.index(task) + 1, task, message,
+                sink=sink)
+        except SlopChurnerError as exc:
+            self._json(500, {"error": str(exc)})
+            return
+        if not result.ok:
+            detail = (result.error or result.output or "agent failed").strip()
+            self._json(500, {"error": detail})
+            return
+        # Tell open UIs the discussion is done (and carry the reply).
+        self.ctx.hub.publish(run_id, {"name": "discuss", "data": {
+            "task_id": task_id, "message": message, "reply": result.output,
+        }})
+        self._json(200, {"ok": True, "reply": result.output})
 
     def _retry(self, run_id: int, task_id: int) -> None:
         row = self.ctx.store.get_run(run_id)
