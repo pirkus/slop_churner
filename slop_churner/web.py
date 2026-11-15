@@ -32,7 +32,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 # Optional HTTP/2 support: the project is otherwise stdlib-only, so the
 # whole h2c path is gated behind this import and degrades to HTTP/1.1.
@@ -325,8 +325,11 @@ class Handler(BaseHTTPRequestHandler):
                     for i in forge.check_forge()
                 ]})
             elif path == "/api/runs":
+                q = parse_qs(urlparse(self.path).query)
+                include_archived = (q.get("include_archived", [""])[0]
+                                    .strip().lower() in ("1", "true"))
                 runs = []
-                for r in self.ctx.store.list_runs():
+                for r in self.ctx.store.list_runs(include_archived=include_archived):
                     d = dict(r)
                     d["params"] = json.loads(d["params"])
                     d["running"] = r["id"] in self.ctx.workers
@@ -366,6 +369,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._accept_run(int(m.group(1)))
             elif m := re.fullmatch(r"/api/runs/(\d+)/discard", path):
                 self._discard_run(int(m.group(1)))
+            elif m := re.fullmatch(r"/api/runs/(\d+)/archive", path):
+                self._archive_run(int(m.group(1)), True)
+            elif m := re.fullmatch(r"/api/runs/(\d+)/unarchive", path):
+                self._archive_run(int(m.group(1)), False)
             elif m := re.fullmatch(r"/api/runs/(\d+)/retry/(\d+)", path):
                 self._retry(int(m.group(1)), int(m.group(2)))
             elif m := re.fullmatch(r"/api/runs/(\d+)/tasks/(\d+)/discuss", path):
@@ -628,6 +635,13 @@ class Handler(BaseHTTPRequestHandler):
         self.ctx.release_repo(repo, run_id)
         self.ctx.hub.publish(run_id, {"name": "closed", "data": {"status": "rejected", "error": None}})
         self._json(200, {"ok": True, "status": "rejected"})
+
+    def _archive_run(self, run_id: int, archived: bool) -> None:
+        if self.ctx.store.get_run(run_id) is None:
+            self._json(404, {"error": "no such run"})
+            return
+        self.ctx.store.set_run_archived(run_id, archived)
+        self._json(200, {"ok": True, "archived": archived})
 
     def _cancel(self, run_id: int) -> None:
         cancel = self.ctx.workers.get(run_id)
