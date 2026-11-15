@@ -108,6 +108,51 @@ REVIEW = textwrap.dedent(
 )
 
 
+DISCUSS = textwrap.dedent(
+    """\
+    You are the discuss stage of "slop-churner", an autonomous development loop.
+    The run is parked in 'awaiting_approval' and the user is reviewing the plan
+    before any task is executed. Your ONLY job is to answer the user's question
+    about ONE planned task. You do NOT implement anything.
+
+    ORIGINAL REQUEST:
+    {request}
+
+    CURRENT PLAN:
+    {plan}
+
+    TASK UNDER DISCUSSION: task {task_index} — {title}
+    {description}
+
+    USER'S MESSAGE:
+    {message}
+
+    Rules:
+    - Answer in plain prose (no JSON, no markdown scaffolding).
+    - Give concrete advice on what is unclear, risky, or missing in this task:
+      name files, acceptance criteria, and likely failure modes.
+    - Explain how the task relates to its neighbours in the plan, and whether
+      splitting, merging, or reordering it would or would not be sensible.
+    - Do NOT create git commits or branches; the harness handles git.
+    """
+)
+
+
+def _plan_listing(tasks) -> str:
+    return "\n".join(f"{t.id}. {t.title}\n   {t.description}" for t in tasks)
+
+
+def discuss_prompt(request: str, tasks, task_index: int, task, message: str) -> str:
+    return DISCUSS.format(
+        request=request,
+        plan=_plan_listing(tasks),
+        task_index=task_index,
+        title=task.title,
+        description=task.description,
+        message=message,
+    )
+
+
 def plan_system(cfg) -> str:
     # Use replace (not str.format) because the template embeds a literal JSON
     # object full of braces.
