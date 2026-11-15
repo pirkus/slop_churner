@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS runs (
     -- (see apply_event "planned"). Stored as its own column so plans can
     -- be edited/replaced per run without touching the immutable `params`.
     plan_test_cmd TEXT,
+    archived    INTEGER NOT NULL DEFAULT 0,
     status      TEXT NOT NULL DEFAULT 'queued',
     error       TEXT,
     created_at  TEXT NOT NULL,
@@ -109,6 +110,8 @@ class Store:
             cols = {r[1] for r in self._conn.execute("PRAGMA table_info(runs)")}
             if "plan_test_cmd" not in cols:
                 self._conn.execute("ALTER TABLE runs ADD COLUMN plan_test_cmd TEXT")
+            if "archived" not in cols:
+                self._conn.execute("ALTER TABLE runs ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
             self._conn.commit()
 
     def close(self) -> None:
@@ -204,15 +207,24 @@ class Store:
             ).fetchall()]
             return {"test_cmd": row["plan_test_cmd"], "tasks": tasks}
 
-    def list_runs(self) -> list[sqlite3.Row]:
+    def set_run_archived(self, run_id: int, archived: bool) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE runs SET archived = ?, updated_at = ? WHERE id = ?",
+                (1 if archived else 0, _now(), run_id),
+            )
+            self._conn.commit()
+
+    def list_runs(self, include_archived: bool = False) -> list[sqlite3.Row]:
+        where = "" if include_archived else "WHERE r.archived = 0"
         with self._lock:
             self._conn.row_factory = sqlite3.Row
             return self._conn.execute(
-                """
+                f"""
                 SELECT r.*,
                        (SELECT COUNT(*) FROM tasks t WHERE t.run_id = r.id) AS n_tasks,
                        (SELECT COUNT(*) FROM tasks t WHERE t.run_id = r.id AND t.status = 'done') AS n_done
-                FROM runs r ORDER BY r.id DESC
+                FROM runs r {where} ORDER BY r.id DESC
                 """
             ).fetchall()
 
