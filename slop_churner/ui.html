@@ -696,7 +696,7 @@ function planReview(data) {
       const taskId = [...list.querySelectorAll(".planrow")].indexOf(row) + 1;
       din.disabled = true;
       dsend.disabled = true;
-      dbusy.style.display = "";
+      dbusy.style.display = "block";
       try {
         const d = await api(`/api/runs/${data.id}/tasks/${taskId}/discuss`, {
           method: "POST",
@@ -704,7 +704,7 @@ function planReview(data) {
           body: JSON.stringify({ message }),
         });
         esc(dresp, d.reply);
-        dresp.style.display = "";
+        dresp.style.display = "block";
       } catch (e) {
         derr.textContent = e.message;
       } finally {
